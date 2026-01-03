@@ -140,8 +140,11 @@ impl ModelFamily {
     }
 
     pub fn auto_compact_token_limit(&self) -> Option<i64> {
-        self.auto_compact_token_limit
-            .or(self.context_window.map(Self::default_auto_compact_limit))
+        match self.auto_compact_token_limit {
+            Some(limit) if limit <= 0 => None,
+            Some(limit) => Some(limit),
+            None => self.context_window.map(Self::default_auto_compact_limit),
+        }
     }
 
     const fn default_auto_compact_limit(context_window: i64) -> i64 {

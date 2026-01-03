@@ -15,20 +15,30 @@ pub(crate) async fn run_inline_remote_auto_compact_task(
     sess: Arc<Session>,
     turn_context: Arc<TurnContext>,
 ) {
-    run_remote_compact_task_inner(&sess, &turn_context).await;
+    run_remote_compact_task_inner(&sess, &turn_context, None).await;
 }
 
-pub(crate) async fn run_remote_compact_task(sess: Arc<Session>, turn_context: Arc<TurnContext>) {
+pub(crate) async fn run_remote_compact_task(
+    sess: Arc<Session>,
+    turn_context: Arc<TurnContext>,
+    compaction_instructions: Option<String>,
+) {
     let start_event = EventMsg::TaskStarted(TaskStartedEvent {
         model_context_window: turn_context.client.get_model_context_window(),
     });
     sess.send_event(&turn_context, start_event).await;
 
-    run_remote_compact_task_inner(&sess, &turn_context).await;
+    run_remote_compact_task_inner(&sess, &turn_context, compaction_instructions).await;
 }
 
-async fn run_remote_compact_task_inner(sess: &Arc<Session>, turn_context: &Arc<TurnContext>) {
-    if let Err(err) = run_remote_compact_task_inner_impl(sess, turn_context).await {
+async fn run_remote_compact_task_inner(
+    sess: &Arc<Session>,
+    turn_context: &Arc<TurnContext>,
+    compaction_instructions: Option<String>,
+) {
+    if let Err(err) =
+        run_remote_compact_task_inner_impl(sess, turn_context, compaction_instructions).await
+    {
         let event = EventMsg::Error(
             err.to_error_event(Some("Error running remote compact task".to_string())),
         );
@@ -39,13 +49,23 @@ async fn run_remote_compact_task_inner(sess: &Arc<Session>, turn_context: &Arc<T
 async fn run_remote_compact_task_inner_impl(
     sess: &Arc<Session>,
     turn_context: &Arc<TurnContext>,
+    compaction_instructions: Option<String>,
 ) -> CodexResult<()> {
     let mut history = sess.clone_history().await;
+
+    let model_family = turn_context.client.get_model_family();
+    let base_instructions = turn_context
+        .base_instructions
+        .as_deref()
+        .unwrap_or(model_family.base_instructions.as_str());
+    let compact_instructions =
+        compaction_instructions.unwrap_or_else(|| turn_context.resolve_compact_prompt());
+    let instructions = format!("{base_instructions}\n\n{compact_instructions}");
     let prompt = Prompt {
         input: history.get_history_for_prompt(),
         tools: vec![],
         parallel_tool_calls: false,
-        base_instructions_override: turn_context.base_instructions.clone(),
+        base_instructions_override: Some(instructions),
         output_schema: None,
     };
 

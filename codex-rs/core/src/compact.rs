@@ -43,7 +43,7 @@ pub(crate) async fn run_inline_auto_compact_task(
     sess: Arc<Session>,
     turn_context: Arc<TurnContext>,
 ) {
-    let prompt = turn_context.compact_prompt().to_string();
+    let prompt = turn_context.resolve_compact_prompt();
     let input = vec![UserInput::Text { text: prompt }];
 
     run_compact_task_inner(sess, turn_context, input).await;

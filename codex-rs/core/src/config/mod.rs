@@ -110,6 +110,12 @@ pub struct Config {
     /// Token usage threshold triggering auto-compaction of conversation history.
     pub model_auto_compact_token_limit: Option<i64>,
 
+    /// Auto-compaction trigger as a percentage of the model context window.
+    ///
+    /// This setting is applied only when `model_auto_compact_token_limit` is unset.
+    /// Values `<= 0` disable auto-compaction.
+    pub model_auto_compact_context_window_percent: Option<i64>,
+
     /// Key into the model_providers map that specifies which provider to use.
     pub model_provider_id: String,
 
@@ -151,6 +157,12 @@ pub struct Config {
 
     /// Compact prompt override.
     pub compact_prompt: Option<String>,
+
+    /// Optional compaction prompt loaded from `experimental_compact_prompt_file`.
+    ///
+    /// When set, Codex will re-read this file at compaction time so edits made
+    /// during a session take effect without restarting.
+    pub compact_prompt_file: Option<AbsolutePathBuf>,
 
     /// Optional external notifier command. When set, Codex will spawn this
     /// program after each completed *turn* (i.e. when the agent finishes
@@ -681,6 +693,12 @@ pub struct ConfigToml {
 
     /// Token usage threshold triggering auto-compaction of conversation history.
     pub model_auto_compact_token_limit: Option<i64>,
+
+    /// Auto-compaction trigger as a percentage of the model context window.
+    ///
+    /// This setting is applied only when `model_auto_compact_token_limit` is unset.
+    /// Values `<= 0` disable auto-compaction.
+    pub model_auto_compact_context_window_percent: Option<i64>,
 
     /// Default approval policy for executing commands.
     pub approval_policy: Option<AskForApproval>,
@@ -1285,6 +1303,10 @@ impl Config {
             .experimental_compact_prompt_file
             .as_ref()
             .or(cfg.experimental_compact_prompt_file.as_ref());
+        let compact_prompt_file = compact_prompt
+            .is_none()
+            .then(|| experimental_compact_prompt_path.cloned())
+            .flatten();
         let file_compact_prompt = Self::try_read_non_empty_file(
             experimental_compact_prompt_path,
             "experimental compact prompt file",
@@ -1312,11 +1334,22 @@ impl Config {
             .set(sandbox_policy)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("{e}")))?;
 
+        if let Some(percent) = cfg.model_auto_compact_context_window_percent
+            && percent > 100
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("model_auto_compact_context_window_percent must be <= 100, got {percent}"),
+            ));
+        }
+
         let config = Self {
             model,
             review_model,
             model_context_window: cfg.model_context_window,
             model_auto_compact_token_limit: cfg.model_auto_compact_token_limit,
+            model_auto_compact_context_window_percent: cfg
+                .model_auto_compact_context_window_percent,
             model_provider_id,
             model_provider,
             cwd: resolved_cwd,
@@ -1330,6 +1363,7 @@ impl Config {
             base_instructions,
             developer_instructions,
             compact_prompt,
+            compact_prompt_file,
             // The config.toml omits "_mode" because it's a config file. However, "_mode"
             // is important in code to differentiate the mode from the store implementation.
             cli_auth_credentials_store_mode: cfg.cli_auth_credentials_store.unwrap_or_default(),
@@ -3154,6 +3188,7 @@ model_verbosity = "high"
                 review_model: OPENAI_DEFAULT_REVIEW_MODEL.to_string(),
                 model_context_window: None,
                 model_auto_compact_token_limit: None,
+                model_auto_compact_context_window_percent: None,
                 model_provider_id: "openai".to_string(),
                 model_provider: fixture.openai_provider.clone(),
                 approval_policy: Constrained::allow_any(AskForApproval::Never),
@@ -3186,6 +3221,7 @@ model_verbosity = "high"
                 base_instructions: None,
                 developer_instructions: None,
                 compact_prompt: None,
+                compact_prompt_file: None,
                 forced_chatgpt_workspace_id: None,
                 forced_login_method: None,
                 include_apply_patch_tool: false,
@@ -3237,6 +3273,7 @@ model_verbosity = "high"
             review_model: OPENAI_DEFAULT_REVIEW_MODEL.to_string(),
             model_context_window: None,
             model_auto_compact_token_limit: None,
+            model_auto_compact_context_window_percent: None,
             model_provider_id: "openai-chat-completions".to_string(),
             model_provider: fixture.openai_chat_completions_provider.clone(),
             approval_policy: Constrained::allow_any(AskForApproval::UnlessTrusted),
@@ -3269,6 +3306,7 @@ model_verbosity = "high"
             base_instructions: None,
             developer_instructions: None,
             compact_prompt: None,
+            compact_prompt_file: None,
             forced_chatgpt_workspace_id: None,
             forced_login_method: None,
             include_apply_patch_tool: false,
@@ -3335,6 +3373,7 @@ model_verbosity = "high"
             review_model: OPENAI_DEFAULT_REVIEW_MODEL.to_string(),
             model_context_window: None,
             model_auto_compact_token_limit: None,
+            model_auto_compact_context_window_percent: None,
             model_provider_id: "openai".to_string(),
             model_provider: fixture.openai_provider.clone(),
             approval_policy: Constrained::allow_any(AskForApproval::OnFailure),
@@ -3367,6 +3406,7 @@ model_verbosity = "high"
             base_instructions: None,
             developer_instructions: None,
             compact_prompt: None,
+            compact_prompt_file: None,
             forced_chatgpt_workspace_id: None,
             forced_login_method: None,
             include_apply_patch_tool: false,
@@ -3419,6 +3459,7 @@ model_verbosity = "high"
             review_model: OPENAI_DEFAULT_REVIEW_MODEL.to_string(),
             model_context_window: None,
             model_auto_compact_token_limit: None,
+            model_auto_compact_context_window_percent: None,
             model_provider_id: "openai".to_string(),
             model_provider: fixture.openai_provider.clone(),
             approval_policy: Constrained::allow_any(AskForApproval::OnFailure),
@@ -3451,6 +3492,7 @@ model_verbosity = "high"
             base_instructions: None,
             developer_instructions: None,
             compact_prompt: None,
+            compact_prompt_file: None,
             forced_chatgpt_workspace_id: None,
             forced_login_method: None,
             include_apply_patch_tool: false,

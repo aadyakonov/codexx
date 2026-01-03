@@ -1636,8 +1636,8 @@ impl ChatWidget {
                         };
                         self.queue_user_message(user_message);
                     }
-                    InputResult::Command(cmd) => {
-                        self.dispatch_command(cmd);
+                    InputResult::Command { cmd, args } => {
+                        self.dispatch_command(cmd, args);
                     }
                     InputResult::None => {}
                 }
@@ -1685,7 +1685,7 @@ impl ChatWidget {
         self.bottom_pane.can_launch_external_editor()
     }
 
-    fn dispatch_command(&mut self, cmd: SlashCommand) {
+    fn dispatch_command(&mut self, cmd: SlashCommand, args: Option<String>) {
         if !cmd.available_during_task() && self.bottom_pane.is_task_running() {
             let message = format!(
                 "'/{}' is disabled while a task is in progress.",
@@ -1723,7 +1723,12 @@ impl ChatWidget {
             }
             SlashCommand::Compact => {
                 self.clear_token_usage();
-                self.app_event_tx.send(AppEvent::CodexOp(Op::Compact));
+                let instructions = args.and_then(|arg| {
+                    let trimmed = arg.trim();
+                    (!trimmed.is_empty()).then_some(trimmed.to_string())
+                });
+                self.app_event_tx
+                    .send(AppEvent::CodexOp(Op::Compact { instructions }));
             }
             SlashCommand::Review => {
                 self.open_review_popup();

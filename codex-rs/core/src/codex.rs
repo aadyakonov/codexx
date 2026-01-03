@@ -44,6 +44,7 @@ use codex_protocol::protocol::TaskStartedEvent;
 use codex_protocol::protocol::TurnAbortReason;
 use codex_protocol::protocol::TurnContextItem;
 use codex_rmcp_client::ElicitationResponse;
+use codex_utils_absolute_path::AbsolutePathBuf;
 use futures::future::BoxFuture;
 use futures::prelude::*;
 use futures::stream::FuturesOrdered;
@@ -363,6 +364,7 @@ pub(crate) struct TurnContext {
     pub(crate) developer_instructions: Option<String>,
     pub(crate) base_instructions: Option<String>,
     pub(crate) compact_prompt: Option<String>,
+    pub(crate) compact_prompt_file: Option<AbsolutePathBuf>,
     pub(crate) user_instructions: Option<String>,
     pub(crate) approval_policy: AskForApproval,
     pub(crate) sandbox_policy: SandboxPolicy,
@@ -386,6 +388,30 @@ impl TurnContext {
         self.compact_prompt
             .as_deref()
             .unwrap_or(compact::SUMMARIZATION_PROMPT)
+    }
+
+    pub(crate) fn resolve_compact_prompt(&self) -> String {
+        if let Some(path) = &self.compact_prompt_file {
+            match std::fs::read_to_string(path) {
+                Ok(contents) => {
+                    let trimmed = contents.trim();
+                    if !trimmed.is_empty() {
+                        return trimmed.to_string();
+                    }
+                    warn!(
+                        "compaction prompt file is empty; falling back to cached prompt. path={}",
+                        path.display()
+                    );
+                }
+                Err(err) => {
+                    warn!(
+                        "failed to read compaction prompt file; falling back to cached prompt. path={} err={err}",
+                        path.display()
+                    );
+                }
+            }
+        }
+        self.compact_prompt().to_string()
     }
 }
 
@@ -521,6 +547,7 @@ impl Session {
             developer_instructions: session_configuration.developer_instructions.clone(),
             base_instructions: session_configuration.base_instructions.clone(),
             compact_prompt: session_configuration.compact_prompt.clone(),
+            compact_prompt_file: per_turn_config.compact_prompt_file.clone(),
             user_instructions: session_configuration.user_instructions.clone(),
             approval_policy: session_configuration.approval_policy.value(),
             sandbox_policy: session_configuration.sandbox_policy.get().clone(),
@@ -1655,8 +1682,8 @@ async fn submission_loop(sess: Arc<Session>, config: Arc<Config>, rx_sub: Receiv
             Op::Undo => {
                 handlers::undo(&sess, sub.id.clone()).await;
             }
-            Op::Compact => {
-                handlers::compact(&sess, sub.id.clone()).await;
+            Op::Compact { instructions } => {
+                handlers::compact(&sess, sub.id.clone(), instructions).await;
             }
             Op::RunUserShellCommand { command } => {
                 handlers::run_user_shell_command(
@@ -2012,14 +2039,20 @@ mod handlers {
             .await;
     }
 
-    pub async fn compact(sess: &Arc<Session>, sub_id: String) {
+    pub async fn compact(sess: &Arc<Session>, sub_id: String, instructions: Option<String>) {
         let turn_context = sess.new_default_turn_with_sub_id(sub_id).await;
+
+        let base_prompt = turn_context.resolve_compact_prompt();
+        let prompt = match instructions.as_deref().map(str::trim) {
+            Some(extra) if !extra.is_empty() => {
+                format!("{base_prompt}\n\nAdditional compaction instructions:\n{extra}")
+            }
+            _ => base_prompt,
+        };
 
         sess.spawn_task(
             Arc::clone(&turn_context),
-            vec![UserInput::Text {
-                text: turn_context.compact_prompt().to_string(),
-            }],
+            vec![UserInput::Text { text: prompt }],
             CompactTask,
         )
         .await;
@@ -2156,6 +2189,7 @@ async fn spawn_review_thread(
         user_instructions: None,
         base_instructions: Some(base_instructions.clone()),
         compact_prompt: parent_turn_context.compact_prompt.clone(),
+        compact_prompt_file: parent_turn_context.compact_prompt_file.clone(),
         approval_policy: parent_turn_context.approval_policy,
         sandbox_policy: parent_turn_context.sandbox_policy.clone(),
         shell_environment_policy: parent_turn_context.shell_environment_policy.clone(),
@@ -2229,11 +2263,28 @@ pub(crate) async fn run_task(
         return None;
     }
 
-    let auto_compact_limit = turn_context
-        .client
-        .get_model_family()
-        .auto_compact_token_limit()
-        .unwrap_or(i64::MAX);
+    let config = turn_context.client.config();
+    let auto_compact_limit = if config.model_auto_compact_token_limit.is_some() {
+        turn_context
+            .client
+            .get_model_family()
+            .auto_compact_token_limit()
+    } else if let Some(percent) = config.model_auto_compact_context_window_percent {
+        if percent <= 0 {
+            None
+        } else {
+            turn_context
+                .client
+                .get_model_context_window()
+                .map(|window| (window.saturating_mul(percent) / 100).max(1))
+        }
+    } else {
+        turn_context
+            .client
+            .get_model_family()
+            .auto_compact_token_limit()
+    }
+    .unwrap_or(i64::MAX);
     let total_usage_tokens = sess.get_total_token_usage().await;
     if total_usage_tokens >= auto_compact_limit {
         run_auto_compact(&sess, &turn_context).await;

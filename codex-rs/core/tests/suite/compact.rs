@@ -17,6 +17,7 @@ use codex_core::protocol::SandboxPolicy;
 use codex_core::protocol::WarningEvent;
 use codex_protocol::config_types::ReasoningSummary;
 use codex_protocol::user_input::UserInput;
+use codex_utils_absolute_path::AbsolutePathBuf;
 use core_test_support::load_default_config_for_test;
 use core_test_support::responses::ev_local_shell_call;
 use core_test_support::responses::ev_reasoning_item;
@@ -25,6 +26,7 @@ use core_test_support::test_codex::test_codex;
 use core_test_support::wait_for_event;
 use core_test_support::wait_for_event_match;
 use std::collections::VecDeque;
+use std::fs;
 use tempfile::TempDir;
 
 use core_test_support::responses::ev_assistant_message;
@@ -167,7 +169,10 @@ async fn summarize_context_three_requests_and_instructions() {
     wait_for_event(&codex, |ev| matches!(ev, EventMsg::TaskComplete(_))).await;
 
     // 2) Summarize – second hit should include the summarization prompt.
-    codex.submit(Op::Compact).await.unwrap();
+    codex
+        .submit(Op::Compact { instructions: None })
+        .await
+        .unwrap();
     let warning_event = wait_for_event(&codex, |ev| matches!(ev, EventMsg::Warning(_))).await;
     let EventMsg::Warning(WarningEvent { message }) = warning_event else {
         panic!("expected warning event after compact");
@@ -348,7 +353,10 @@ async fn manual_compact_uses_custom_prompt() {
         .expect("create conversation")
         .conversation;
 
-    codex.submit(Op::Compact).await.expect("trigger compact");
+    codex
+        .submit(Op::Compact { instructions: None })
+        .await
+        .expect("trigger compact");
     let warning_event = wait_for_event(&codex, |ev| matches!(ev, EventMsg::Warning(_))).await;
     let EventMsg::Warning(WarningEvent { message }) = warning_event else {
         panic!("expected warning event after compact");
@@ -428,7 +436,10 @@ async fn manual_compact_emits_api_and_local_token_usage_events() {
     } = conversation_manager.new_conversation(config).await.unwrap();
 
     // Trigger manual compact and collect TokenCount events for the compact turn.
-    codex.submit(Op::Compact).await.unwrap();
+    codex
+        .submit(Op::Compact { instructions: None })
+        .await
+        .unwrap();
 
     // First TokenCount: from the compact API call (usage.total_tokens = 0).
     let first = wait_for_event_match(&codex, |ev| match ev {
@@ -1231,6 +1242,109 @@ async fn auto_compact_runs_after_token_limit_hit() {
     );
 }
 
+// Windows CI only: bump to 4 workers to prevent SSE/event starvation and test timeouts.
+#[cfg_attr(windows, tokio::test(flavor = "multi_thread", worker_threads = 4))]
+#[cfg_attr(not(windows), tokio::test(flavor = "multi_thread", worker_threads = 2))]
+async fn auto_compact_disabled_when_token_limit_is_zero() {
+    skip_if_no_network!();
+
+    let server = start_mock_server().await;
+
+    let sse1 = sse(vec![
+        ev_assistant_message("m1", FIRST_REPLY),
+        ev_completed_with_tokens("r1", 70_000),
+    ]);
+
+    let sse2 = sse(vec![
+        ev_assistant_message("m2", "SECOND_REPLY"),
+        ev_completed_with_tokens("r2", 330_000),
+    ]);
+
+    let sse3 = sse(vec![
+        ev_assistant_message("m3", FINAL_REPLY),
+        ev_completed_with_tokens("r3", 120),
+    ]);
+
+    let first_matcher = |req: &wiremock::Request| {
+        let body = std::str::from_utf8(&req.body).unwrap_or("");
+        body.contains(FIRST_AUTO_MSG)
+            && !body.contains(SECOND_AUTO_MSG)
+            && !body_contains_text(body, SUMMARIZATION_PROMPT)
+    };
+    mount_sse_once_match(&server, first_matcher, sse1).await;
+
+    let second_matcher = |req: &wiremock::Request| {
+        let body = std::str::from_utf8(&req.body).unwrap_or("");
+        body.contains(SECOND_AUTO_MSG)
+            && body.contains(FIRST_AUTO_MSG)
+            && !body_contains_text(body, SUMMARIZATION_PROMPT)
+    };
+    mount_sse_once_match(&server, second_matcher, sse2).await;
+
+    let third_matcher = |req: &wiremock::Request| {
+        let body = std::str::from_utf8(&req.body).unwrap_or("");
+        body.contains(POST_AUTO_USER_MSG) && !body_contains_text(body, SUMMARIZATION_PROMPT)
+    };
+    mount_sse_once_match(&server, third_matcher, sse3).await;
+
+    let model_provider = non_openai_model_provider(&server);
+
+    let home = TempDir::new().unwrap();
+    let mut config = load_default_config_for_test(&home).await;
+    config.model_provider = model_provider;
+    set_test_compact_prompt(&mut config);
+    config.model_auto_compact_token_limit = Some(0);
+    let conversation_manager = ConversationManager::with_models_provider(
+        CodexAuth::from_api_key("dummy"),
+        config.model_provider.clone(),
+    );
+    let codex = conversation_manager
+        .new_conversation(config)
+        .await
+        .unwrap()
+        .conversation;
+
+    codex
+        .submit(Op::UserInput {
+            items: vec![UserInput::Text {
+                text: FIRST_AUTO_MSG.into(),
+            }],
+        })
+        .await
+        .unwrap();
+    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TaskComplete(_))).await;
+
+    codex
+        .submit(Op::UserInput {
+            items: vec![UserInput::Text {
+                text: SECOND_AUTO_MSG.into(),
+            }],
+        })
+        .await
+        .unwrap();
+    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TaskComplete(_))).await;
+
+    codex
+        .submit(Op::UserInput {
+            items: vec![UserInput::Text {
+                text: POST_AUTO_USER_MSG.into(),
+            }],
+        })
+        .await
+        .unwrap();
+    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TaskComplete(_))).await;
+
+    let requests = get_responses_requests(&server).await;
+    assert_eq!(requests.len(), 3, "expected only user turns");
+    assert!(
+        requests.iter().all(|req| !body_contains_text(
+            std::str::from_utf8(&req.body).unwrap_or(""),
+            SUMMARIZATION_PROMPT
+        )),
+        "auto compact should be disabled when the token limit is 0"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn auto_compact_runs_after_resume_when_token_usage_is_over_limit() {
     skip_if_no_network!();
@@ -1534,7 +1648,10 @@ async fn manual_compact_retries_after_context_window_error() {
         .unwrap();
     wait_for_event(&codex, |ev| matches!(ev, EventMsg::TaskComplete(_))).await;
 
-    codex.submit(Op::Compact).await.unwrap();
+    codex
+        .submit(Op::Compact { instructions: None })
+        .await
+        .unwrap();
     let EventMsg::BackgroundEvent(event) =
         wait_for_event(&codex, |ev| matches!(ev, EventMsg::BackgroundEvent(_))).await
     else {
@@ -1666,7 +1783,10 @@ async fn manual_compact_twice_preserves_latest_user_messages() {
         .unwrap();
     wait_for_event(&codex, |ev| matches!(ev, EventMsg::TaskComplete(_))).await;
 
-    codex.submit(Op::Compact).await.unwrap();
+    codex
+        .submit(Op::Compact { instructions: None })
+        .await
+        .unwrap();
     wait_for_event(&codex, |ev| matches!(ev, EventMsg::TaskComplete(_))).await;
 
     codex
@@ -1679,7 +1799,10 @@ async fn manual_compact_twice_preserves_latest_user_messages() {
         .unwrap();
     wait_for_event(&codex, |ev| matches!(ev, EventMsg::TaskComplete(_))).await;
 
-    codex.submit(Op::Compact).await.unwrap();
+    codex
+        .submit(Op::Compact { instructions: None })
+        .await
+        .unwrap();
     wait_for_event(&codex, |ev| matches!(ev, EventMsg::TaskComplete(_))).await;
 
     codex
@@ -2148,5 +2271,142 @@ async fn auto_compact_counts_encrypted_reasoning_before_last_user() {
     assert!(
         third_request_body.contains("ENCRYPTED_COMPACTION_SUMMARY"),
         "third turn should include compaction summary item"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn auto_compact_respects_context_window_percent_and_prompt_file() {
+    skip_if_no_network!();
+
+    let server = start_mock_server().await;
+
+    let user_messages = [
+        "AUTO_COMPACT_PERCENT_USER_1",
+        "AUTO_COMPACT_PERCENT_USER_2",
+        "AUTO_COMPACT_PERCENT_USER_3",
+        "AUTO_COMPACT_PERCENT_USER_4",
+    ];
+
+    let request_log = mount_sse_sequence(
+        &server,
+        vec![
+            sse(vec![
+                ev_assistant_message("m1", FIRST_REPLY),
+                ev_completed_with_tokens("r1", 10),
+            ]),
+            // Token usage is 360. With `model_context_window=401` and `percent=95`, auto compact should
+            // not run yet (threshold is 361). If we incorrectly use the default (90%) threshold, this
+            // would compact on the next turn.
+            sse(vec![
+                ev_assistant_message("m2", "SECOND_REPLY"),
+                ev_completed_with_tokens("r2", 360),
+            ]),
+            // Reach the percent-based threshold (361) so auto compact runs before the next user turn.
+            sse(vec![
+                ev_assistant_message("m3", "THIRD_REPLY"),
+                ev_completed_with_tokens("r3", 361),
+            ]),
+            sse(vec![
+                ev_assistant_message("m4", FINAL_REPLY),
+                ev_completed_with_tokens("r4", 1),
+            ]),
+        ],
+    )
+    .await;
+
+    let prompt_dir = TempDir::new().unwrap();
+    let compact_prompt_path = prompt_dir.path().join("compact.md");
+    let prompt_marker = "CUSTOM_COMPACT_PROMPT_FROM_FILE";
+    fs::write(&compact_prompt_path, prompt_marker).unwrap();
+    let compact_prompt_file = AbsolutePathBuf::from_absolute_path(&compact_prompt_path).unwrap();
+
+    let compacted_history = vec![
+        codex_protocol::models::ResponseItem::Message {
+            id: None,
+            role: "user".to_string(),
+            content: vec![codex_protocol::models::ContentItem::InputText {
+                text: "REMOTE_COMPACT_SUMMARY".to_string(),
+            }],
+        },
+        codex_protocol::models::ResponseItem::Compaction {
+            encrypted_content: "ENCRYPTED_COMPACTION_SUMMARY".to_string(),
+        },
+    ];
+    let compact_mock =
+        mount_compact_json_once(&server, serde_json::json!({ "output": compacted_history })).await;
+
+    let codex = test_codex()
+        .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
+        .with_config({
+            let compact_prompt_file = compact_prompt_file.clone();
+            move |config| {
+                config.compact_prompt = None;
+                config.compact_prompt_file = Some(compact_prompt_file);
+                config.model_context_window = Some(401);
+                config.model_auto_compact_token_limit = None;
+                config.model_auto_compact_context_window_percent = Some(95);
+                config.features.enable(Feature::RemoteCompaction);
+            }
+        })
+        .build(&server)
+        .await
+        .expect("build codex")
+        .codex;
+
+    for user in user_messages {
+        codex
+            .submit(Op::UserInput {
+                items: vec![UserInput::Text { text: user.into() }],
+            })
+            .await
+            .unwrap();
+        wait_for_event(&codex, |ev| matches!(ev, EventMsg::TaskComplete(_))).await;
+    }
+
+    let compact_requests = compact_mock.requests();
+    assert_eq!(
+        compact_requests.len(),
+        1,
+        "remote compaction should run once after reaching the percent threshold"
+    );
+    assert_eq!(
+        compact_requests[0].path(),
+        "/v1/responses/compact",
+        "remote compaction should hit the compact endpoint"
+    );
+
+    let instructions = compact_requests[0]
+        .body_json()
+        .get("instructions")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        instructions.contains(prompt_marker),
+        "remote compact instructions should include contents of compact prompt file"
+    );
+
+    let requests = request_log.requests();
+    assert_eq!(
+        requests.len(),
+        4,
+        "conversation should include four user turns"
+    );
+
+    let third_request_body = requests[2].body_json().to_string();
+    assert!(
+        !third_request_body.contains("REMOTE_COMPACT_SUMMARY"),
+        "third turn should not include compacted history"
+    );
+
+    let fourth_request_body = requests[3].body_json().to_string();
+    assert!(
+        fourth_request_body.contains("REMOTE_COMPACT_SUMMARY")
+            || fourth_request_body.contains(FINAL_REPLY),
+        "fourth turn should include compacted history"
+    );
+    assert!(
+        fourth_request_body.contains("ENCRYPTED_COMPACTION_SUMMARY"),
+        "fourth turn should include compaction summary item"
     );
 }

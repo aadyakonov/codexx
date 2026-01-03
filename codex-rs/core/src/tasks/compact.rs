@@ -29,7 +29,13 @@ impl SessionTask for CompactTask {
             session.as_ref(),
             &ctx.client.get_provider(),
         ) {
-            crate::compact_remote::run_remote_compact_task(session, ctx).await
+            let compaction_instructions = input.iter().find_map(|item| match item {
+                UserInput::Text { text } => Some(text.clone()),
+                UserInput::Image { .. } => None,
+                _ => None,
+            });
+            crate::compact_remote::run_remote_compact_task(session, ctx, compaction_instructions)
+                .await
         } else {
             crate::compact::run_compact_task(session, ctx, input).await
         }
