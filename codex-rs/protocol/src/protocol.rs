@@ -505,6 +505,13 @@ impl SandboxPolicy {
                         if top_level_codex.as_path().is_dir() {
                             subpaths.push(top_level_codex);
                         }
+                        #[allow(clippy::expect_used)]
+                        let top_level_codexx = writable_root
+                            .join(".codexx")
+                            .expect(".codexx is a valid relative path");
+                        if top_level_codexx.as_path().is_dir() {
+                            subpaths.push(top_level_codexx);
+                        }
                         WritableRoot {
                             root: writable_root,
                             read_only_subpaths: subpaths,
@@ -1456,17 +1463,13 @@ pub struct ReviewLineRange {
 
 #[derive(Debug, Clone, Copy, Display, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum ExecCommandSource {
+    #[default]
     Agent,
     UserShell,
     UnifiedExecStartup,
     UnifiedExecInteraction,
-}
-
-impl Default for ExecCommandSource {
-    fn default() -> Self {
-        Self::Agent
-    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, TS)]

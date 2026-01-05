@@ -11,6 +11,7 @@ use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::mpsc::unbounded_channel;
 
 use crate::app_event::AppEvent;
+use crate::app_event::NewSessionSeed;
 use crate::app_event_sender::AppEventSender;
 
 /// Spawn the agent bootstrapper and op forwarding loop, returning the
@@ -19,16 +20,30 @@ pub(crate) fn spawn_agent(
     config: Config,
     app_event_tx: AppEventSender,
     server: Arc<ConversationManager>,
+    seed: NewSessionSeed,
 ) -> UnboundedSender<Op> {
     let (codex_op_tx, mut codex_op_rx) = unbounded_channel::<Op>();
 
     let app_event_tx_clone = app_event_tx;
     tokio::spawn(async move {
+        let conversation_result = match seed {
+            NewSessionSeed::None => server.new_conversation(config).await,
+            NewSessionSeed::LastCompactionSegment {
+                source_rollout_path,
+            } => {
+                server
+                    .new_conversation_seeded_from_last_compaction_segment(
+                        config,
+                        source_rollout_path,
+                    )
+                    .await
+            }
+        };
         let NewConversation {
             conversation_id: _,
             conversation,
             session_configured,
-        } = match server.new_conversation(config).await {
+        } = match conversation_result {
             Ok(v) => v,
             #[allow(clippy::print_stderr)]
             Err(err) => {

@@ -58,8 +58,8 @@ const DEFAULT_PROJECT_ROOT_MARKERS: &[&str] = &[".git"];
 /// - system    `/etc/codex/config.toml`
 /// - user      `${CODEX_HOME}/config.toml`
 /// - cwd       `${PWD}/config.toml`
-/// - tree      parent directories up to root looking for `./.codex/config.toml`
-/// - repo      `$(git rev-parse --show-toplevel)/.codex/config.toml`
+/// - tree      parent directories up to root looking for `./.codexx/config.toml`
+/// - repo      `$(git rev-parse --show-toplevel)/.codexx/config.toml`
 /// - runtime   e.g., --config flags, model selector in UI
 ///
 /// (*) Only available on macOS via managed device profiles.
@@ -468,7 +468,7 @@ async fn load_project_layers(
 
     let mut layers = Vec::new();
     for dir in dirs {
-        let dot_codex = dir.join(".codex");
+        let dot_codex = dir.join(".codexx");
         if !tokio::fs::metadata(&dot_codex)
             .await
             .map(|meta| meta.is_dir())

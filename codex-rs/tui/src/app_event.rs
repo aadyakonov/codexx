@@ -21,7 +21,9 @@ pub(crate) enum AppEvent {
     CodexEvent(Event),
 
     /// Start a new session.
-    NewSession,
+    NewSession {
+        seed: NewSessionSeed,
+    },
 
     /// Open the resume picker inside the running TUI session.
     OpenResumePicker,
@@ -184,6 +186,14 @@ pub(crate) enum AppEvent {
 
     /// Launch the external editor after a normal draw has completed.
     LaunchExternalEditor,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum NewSessionSeed {
+    None,
+    LastCompactionSegment {
+        source_rollout_path: Option<PathBuf>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

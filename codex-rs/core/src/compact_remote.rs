@@ -3,6 +3,7 @@ use std::sync::Arc;
 use crate::Prompt;
 use crate::codex::Session;
 use crate::codex::TurnContext;
+use crate::error::CodexErr;
 use crate::error::Result as CodexResult;
 use crate::protocol::CompactedItem;
 use crate::protocol::ContextCompactedEvent;
@@ -10,6 +11,7 @@ use crate::protocol::EventMsg;
 use crate::protocol::RolloutItem;
 use crate::protocol::TaskStartedEvent;
 use codex_protocol::models::ResponseItem;
+use codex_protocol::user_input::UserInput;
 
 pub(crate) async fn run_inline_remote_auto_compact_task(
     sess: Arc<Session>,
@@ -36,36 +38,47 @@ async fn run_remote_compact_task_inner(
     turn_context: &Arc<TurnContext>,
     compaction_instructions: Option<String>,
 ) {
+    let compact_instructions =
+        compaction_instructions.unwrap_or_else(|| turn_context.resolve_compact_prompt());
+
     if let Err(err) =
-        run_remote_compact_task_inner_impl(sess, turn_context, compaction_instructions).await
+        run_remote_compact_task_inner_impl(sess, turn_context, &compact_instructions).await
     {
-        let event = EventMsg::Error(
-            err.to_error_event(Some("Error running remote compact task".to_string())),
-        );
-        sess.send_event(turn_context, event).await;
+        if matches!(err, CodexErr::InvalidRequest(_)) {
+            sess.notify_background_event(
+                turn_context.as_ref(),
+                format!("Remote compaction failed; falling back to local compaction: {err}"),
+            )
+            .await;
+            crate::compact::run_compact_task_inner(
+                Arc::clone(sess),
+                Arc::clone(turn_context),
+                vec![UserInput::Text {
+                    text: compact_instructions,
+                }],
+            )
+            .await;
+        } else {
+            let event = EventMsg::Error(
+                err.to_error_event(Some("Error running remote compact task".to_string())),
+            );
+            sess.send_event(turn_context, event).await;
+        }
     }
 }
 
 async fn run_remote_compact_task_inner_impl(
     sess: &Arc<Session>,
     turn_context: &Arc<TurnContext>,
-    compaction_instructions: Option<String>,
+    compact_instructions: &str,
 ) -> CodexResult<()> {
     let mut history = sess.clone_history().await;
 
-    let model_family = turn_context.client.get_model_family();
-    let base_instructions = turn_context
-        .base_instructions
-        .as_deref()
-        .unwrap_or(model_family.base_instructions.as_str());
-    let compact_instructions =
-        compaction_instructions.unwrap_or_else(|| turn_context.resolve_compact_prompt());
-    let instructions = format!("{base_instructions}\n\n{compact_instructions}");
     let prompt = Prompt {
         input: history.get_history_for_prompt(),
         tools: vec![],
         parallel_tool_calls: false,
-        base_instructions_override: Some(instructions),
+        base_instructions_override: Some(compact_instructions.to_string()),
         output_schema: None,
     };
 

@@ -85,6 +85,7 @@ use tokio::task::JoinHandle;
 use tracing::debug;
 
 use crate::app_event::AppEvent;
+use crate::app_event::NewSessionSeed;
 use crate::app_event_sender::AppEventSender;
 use crate::bottom_pane::ApprovalRequest;
 use crate::bottom_pane::BetaFeatureItem;
@@ -291,6 +292,7 @@ pub(crate) struct ChatWidgetInit {
     pub(crate) feedback: codex_feedback::CodexFeedback,
     pub(crate) is_first_run: bool,
     pub(crate) model: String,
+    pub(crate) new_session_seed: NewSessionSeed,
 }
 
 #[derive(Default)]
@@ -1415,12 +1417,18 @@ impl ChatWidget {
             feedback,
             is_first_run,
             model,
+            new_session_seed,
         } = common;
         let mut config = config;
         config.model = Some(model.clone());
         let mut rng = rand::rng();
         let placeholder = EXAMPLE_PROMPTS[rng.random_range(0..EXAMPLE_PROMPTS.len())].to_string();
-        let codex_op_tx = spawn_agent(config.clone(), app_event_tx.clone(), conversation_manager);
+        let codex_op_tx = spawn_agent(
+            config.clone(),
+            app_event_tx.clone(),
+            conversation_manager,
+            new_session_seed,
+        );
 
         let mut widget = Self {
             app_event_tx: app_event_tx.clone(),
@@ -1704,7 +1712,8 @@ impl ChatWidget {
                 self.request_redraw();
             }
             SlashCommand::New => {
-                self.app_event_tx.send(AppEvent::NewSession);
+                let seed = parse_new_session_seed(args, self.rollout_path());
+                self.app_event_tx.send(AppEvent::NewSession { seed });
             }
             SlashCommand::Resume => {
                 self.app_event_tx.send(AppEvent::OpenResumePicker);
@@ -2113,7 +2122,15 @@ impl ChatWidget {
                 self.on_entered_review_mode(review_request)
             }
             EventMsg::ExitedReviewMode(review) => self.on_exited_review_mode(review),
-            EventMsg::ContextCompacted(_) => self.on_agent_message("Context compacted".to_owned()),
+            EventMsg::ContextCompacted(_) => {
+                self.on_agent_message("Context compacted".to_owned());
+                if !from_replay && self.config.auto_new_session_on_compaction {
+                    let seed = NewSessionSeed::LastCompactionSegment {
+                        source_rollout_path: self.rollout_path(),
+                    };
+                    self.app_event_tx.send(AppEvent::NewSession { seed });
+                }
+            }
             EventMsg::RawResponseItem(_)
             | EventMsg::ItemStarted(_)
             | EventMsg::ItemCompleted(_)
@@ -3540,6 +3557,37 @@ impl ChatWidget {
             RenderableItem::Borrowed(&self.bottom_pane).inset(Insets::tlbr(1, 0, 0, 0)),
         );
         RenderableItem::Owned(Box::new(flex))
+    }
+}
+
+fn parse_new_session_seed(
+    args: Option<String>,
+    source_rollout_path: Option<PathBuf>,
+) -> NewSessionSeed {
+    let Some(args) = args else {
+        return NewSessionSeed::None;
+    };
+    let trimmed = args.trim();
+    if trimmed.is_empty() {
+        return NewSessionSeed::None;
+    }
+
+    let wants_seed = trimmed.split_whitespace().any(|arg| {
+        matches!(
+            arg,
+            "--seed-last-compaction-segment"
+                | "--seed-last-compaction"
+                | "seed-last-compaction-segment"
+                | "seed-last-compaction"
+        )
+    });
+
+    if wants_seed {
+        NewSessionSeed::LastCompactionSegment {
+            source_rollout_path,
+        }
+    } else {
+        NewSessionSeed::None
     }
 }
 

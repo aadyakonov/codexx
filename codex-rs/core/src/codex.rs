@@ -2264,11 +2264,8 @@ pub(crate) async fn run_task(
     }
 
     let config = turn_context.client.config();
-    let auto_compact_limit = if config.model_auto_compact_token_limit.is_some() {
-        turn_context
-            .client
-            .get_model_family()
-            .auto_compact_token_limit()
+    let auto_compact_limit = if let Some(limit) = config.model_auto_compact_token_limit {
+        if limit <= 0 { None } else { Some(limit) }
     } else if let Some(percent) = config.model_auto_compact_context_window_percent {
         if percent <= 0 {
             None
@@ -2415,10 +2412,40 @@ pub(crate) async fn run_task(
 }
 
 async fn run_auto_compact(sess: &Arc<Session>, turn_context: &Arc<TurnContext>) {
+    maybe_git_commit_before_compaction(sess, turn_context).await;
     if should_use_remote_compact_task(sess.as_ref(), &turn_context.client.get_provider()) {
         run_inline_remote_auto_compact_task(Arc::clone(sess), Arc::clone(turn_context)).await;
     } else {
         run_inline_auto_compact_task(Arc::clone(sess), Arc::clone(turn_context)).await;
+    }
+}
+
+async fn maybe_git_commit_before_compaction(sess: &Arc<Session>, turn_context: &Arc<TurnContext>) {
+    let config = turn_context.client.config();
+    if !config.git_commit_before_compaction {
+        return;
+    }
+
+    match crate::git_info::auto_checkpoint_commit_all_changes(&turn_context.cwd).await {
+        Ok(Some(outcome)) => {
+            sess.notify_background_event(
+                turn_context.as_ref(),
+                format!(
+                    "Committed {sha}: {subject}",
+                    sha = outcome.sha,
+                    subject = outcome.subject
+                ),
+            )
+            .await;
+        }
+        Ok(None) => {}
+        Err(err) => {
+            sess.notify_background_event(
+                turn_context.as_ref(),
+                format!("Auto-commit before compaction failed: {err}"),
+            )
+            .await;
+        }
     }
 }
 

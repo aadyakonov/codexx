@@ -8,14 +8,19 @@ use crate::codex::CodexSpawnOk;
 use crate::codex::INITIAL_SUBMIT_ID;
 use crate::codex_conversation::CodexConversation;
 use crate::config::Config;
+use crate::environment_context::EnvironmentContext;
 use crate::error::CodexErr;
 use crate::error::Result as CodexResult;
 use crate::models_manager::manager::ModelsManager;
 use crate::protocol::Event;
 use crate::protocol::EventMsg;
 use crate::protocol::SessionConfiguredEvent;
+use crate::rollout::INTERACTIVE_SESSION_SOURCES;
 use crate::rollout::RolloutRecorder;
+use crate::shell::default_user_shell;
 use crate::skills::SkillsManager;
+use crate::user_instructions::DeveloperInstructions;
+use crate::user_instructions::UserInstructions;
 use codex_protocol::ConversationId;
 use codex_protocol::items::TurnItem;
 use codex_protocol::models::ResponseItem;
@@ -108,6 +113,58 @@ impl ConversationManager {
             config,
             self.auth_manager.clone(),
             self.models_manager.clone(),
+        )
+        .await
+    }
+
+    pub async fn new_conversation_seeded_from_last_compaction_segment(
+        &self,
+        config: Config,
+        source_rollout_path: Option<PathBuf>,
+    ) -> CodexResult<NewConversation> {
+        let source_rollout_path = match source_rollout_path {
+            Some(path) => Some(path),
+            None => most_recent_rollout_path(&config).await,
+        };
+
+        let Some(source_rollout_path) = source_rollout_path else {
+            return self.new_conversation(config).await;
+        };
+
+        let lines = match crate::rollout::seed::load_rollout_lines(&source_rollout_path).await {
+            Ok(lines) => lines,
+            Err(err) => {
+                tracing::warn!(
+                    "failed to load rollout for seeding: path={} err={err}",
+                    source_rollout_path.display()
+                );
+                return self.new_conversation(config).await;
+            }
+        };
+
+        let segment = crate::rollout::seed::extract_between_last_two_context_compactions(&lines);
+        let cleaned = crate::rollout::seed::sanitize_for_seed(&segment);
+        if cleaned.is_empty() {
+            return self.new_conversation(config).await;
+        }
+
+        let past_session_path = config.codex_home.join("past_session.jsonl");
+        if let Err(err) =
+            crate::rollout::seed::write_rollout_lines_jsonl(&past_session_path, &cleaned).await
+        {
+            tracing::warn!(
+                "failed to write past session seed file: path={} err={err}",
+                past_session_path.display()
+            );
+        }
+
+        let mut rollout_items = build_seed_initial_context(&config);
+        rollout_items.extend(cleaned.into_iter().map(|line| line.item));
+
+        self.resume_conversation_with_history(
+            config,
+            InitialHistory::Forked(rollout_items),
+            self.auth_manager.clone(),
         )
         .await
     }
@@ -261,6 +318,47 @@ impl ConversationManager {
     pub fn get_models_manager(&self) -> Arc<ModelsManager> {
         self.models_manager.clone()
     }
+}
+
+async fn most_recent_rollout_path(config: &Config) -> Option<PathBuf> {
+    let page = RolloutRecorder::list_conversations(
+        &config.codex_home,
+        1,
+        None,
+        INTERACTIVE_SESSION_SOURCES,
+        None,
+        &config.model_provider_id,
+    )
+    .await
+    .ok()?;
+    page.items.first().map(|item| item.path.clone())
+}
+
+fn build_seed_initial_context(config: &Config) -> Vec<RolloutItem> {
+    let mut items = Vec::<RolloutItem>::with_capacity(3);
+    if let Some(developer_instructions) = config.developer_instructions.as_deref() {
+        items.push(RolloutItem::ResponseItem(
+            DeveloperInstructions::new(developer_instructions.to_string()).into(),
+        ));
+    }
+    if let Some(user_instructions) = config.user_instructions.as_deref() {
+        items.push(RolloutItem::ResponseItem(
+            UserInstructions {
+                text: user_instructions.to_string(),
+                directory: config.cwd.to_string_lossy().into_owned(),
+            }
+            .into(),
+        ));
+    }
+    items.push(RolloutItem::ResponseItem(ResponseItem::from(
+        EnvironmentContext::new(
+            Some(config.cwd.clone()),
+            Some(config.approval_policy.value()),
+            Some(config.sandbox_policy.get().clone()),
+            default_user_shell(),
+        ),
+    )));
+    items
 }
 
 /// Return a prefix of `items` obtained by cutting strictly before the nth user message

@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::app::App;
+use crate::app_event::NewSessionSeed;
 use crate::history_cell::SessionInfoCell;
 use crate::history_cell::UserHistoryCell;
 use crate::pager_overlay::Overlay;
@@ -350,6 +351,7 @@ impl App {
             models_manager: self.server.get_models_manager(),
             feedback: self.feedback.clone(),
             is_first_run: false,
+            new_session_seed: NewSessionSeed::None,
         };
         self.chat_widget =
             crate::chatwidget::ChatWidget::new_from_existing(init, conv, session_configured);

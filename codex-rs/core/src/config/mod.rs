@@ -108,6 +108,8 @@ pub struct Config {
     pub model_context_window: Option<i64>,
 
     /// Token usage threshold triggering auto-compaction of conversation history.
+    ///
+    /// Values `<= 0` disable auto-compaction.
     pub model_auto_compact_token_limit: Option<i64>,
 
     /// Auto-compaction trigger as a percentage of the model context window.
@@ -171,7 +173,7 @@ pub struct Config {
     /// appends one extra argument containing a JSON payload describing the
     /// event.
     ///
-    /// Example `~/.codex/config.toml` snippet:
+    /// Example `~/.codexx/config.toml` snippet:
     ///
     /// ```toml
     /// notify = ["notify-send", "Codex"]
@@ -195,6 +197,20 @@ pub struct Config {
 
     /// Show startup tooltips in the TUI welcome screen.
     pub show_tooltips: bool,
+
+    /// When `true`, starting a fresh interactive session will seed the initial
+    /// history from the segment between the last two "Context compacted"
+    /// events.
+    pub seed_last_compaction_segment_on_startup: bool,
+
+    /// When `true`, the interactive UI will automatically start a new session
+    /// seeded from the segment between the last two "Context compacted" events
+    /// whenever a compaction completes.
+    pub auto_new_session_on_compaction: bool,
+
+    /// When `true`, Codex will create a real `git commit` (staging all changes)
+    /// right before auto-compaction runs.
+    pub git_commit_before_compaction: bool,
 
     /// Override the events-per-wheel-tick factor for TUI2 scroll normalization.
     ///
@@ -284,11 +300,11 @@ pub struct Config {
     /// Token budget applied when storing tool/function outputs in the context manager.
     pub tool_output_token_limit: Option<usize>,
 
-    /// Directory containing all Codex state (defaults to `~/.codex` but can be
-    /// overridden by the `CODEX_HOME` environment variable).
+    /// Directory containing all Codex state (defaults to `~/.codexx` but can be
+    /// overridden by the `CODEXX_HOME` or `CODEX_HOME` environment variables).
     pub codex_home: PathBuf,
 
-    /// Settings that govern if and what will be written to `~/.codex/history.jsonl`.
+    /// Settings that govern if and what will be written to `~/.codexx/history.jsonl`.
     pub history: History,
 
     /// Optional URI-based file opener. If set, citations to files in the model
@@ -418,13 +434,11 @@ impl ConfigBuilder {
                 .await?;
         let merged_toml = config_layer_stack.effective_config();
 
-        // Note that each layer in ConfigLayerStack should have resolved
-        // relative paths to absolute paths based on the parent folder of the
-        // respective config file, so we should be safe to deserialize without
-        // AbsolutePathBufGuard here.
-        let config_toml: ConfigToml = merged_toml
-            .try_into()
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        // Each layer in ConfigLayerStack should resolve relative paths for
+        // AbsolutePathBuf fields, but apply a final AbsolutePathBufGuard here
+        // to avoid errors when a relative path slips through (e.g. via
+        // overrides).
+        let config_toml = deserialize_config_toml_with_base(merged_toml, &codex_home)?;
         Config::load_config_with_layer_stack(
             config_toml,
             harness_overrides,
@@ -513,7 +527,7 @@ pub async fn load_global_mcp_servers(
     // result.
     let cli_overrides = Vec::<(String, TomlValue)>::new();
     // There is no cwd/project context for this query, so this will not include
-    // MCP servers defined in in-repo .codex/ folders.
+    // MCP servers defined in in-repo .codexx/ folders.
     let cwd: Option<AbsolutePathBuf> = None;
     let config_layer_stack =
         load_config_layers_state(codex_home, cwd, &cli_overrides, LoaderOverrides::default())
@@ -677,7 +691,7 @@ pub fn set_default_oss_provider(codex_home: &Path, provider: &str) -> std::io::R
     Ok(())
 }
 
-/// Base config deserialized from ~/.codex/config.toml.
+/// Base config deserialized from `$CODEXX_HOME/config.toml` (defaults to `~/.codexx/config.toml`).
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
 pub struct ConfigToml {
     /// Optional override of model selection.
@@ -692,6 +706,8 @@ pub struct ConfigToml {
     pub model_context_window: Option<i64>,
 
     /// Token usage threshold triggering auto-compaction of conversation history.
+    ///
+    /// Values `<= 0` disable auto-compaction.
     pub model_auto_compact_token_limit: Option<i64>,
 
     /// Auto-compaction trigger as a percentage of the model context window.
@@ -773,7 +789,7 @@ pub struct ConfigToml {
     #[serde(default)]
     pub profiles: HashMap<String, ConfigProfile>,
 
-    /// Settings that govern if and what will be written to `~/.codex/history.jsonl`.
+    /// Settings that govern if and what will be written to `~/.codexx/history.jsonl`.
     #[serde(default)]
     pub history: Option<History>,
 
@@ -817,7 +833,7 @@ pub struct ConfigToml {
     pub ghost_snapshot: Option<GhostSnapshotToml>,
 
     /// Markers used to detect the project root when searching parent
-    /// directories for `.codex` folders. Defaults to [".git"] when unset.
+    /// directories for `.codexx` folders. Defaults to [".git"] when unset.
     #[serde(default)]
     pub project_root_markers: Option<Vec<String>>,
 
@@ -846,6 +862,20 @@ pub struct ConfigToml {
     pub experimental_compact_prompt_file: Option<AbsolutePathBuf>,
     pub experimental_use_unified_exec_tool: Option<bool>,
     pub experimental_use_freeform_apply_patch: Option<bool>,
+
+    /// When `true`, starting a fresh interactive session will seed the initial
+    /// history from the segment between the last two "Context compacted"
+    /// events.
+    pub experimental_seed_last_compaction_segment_on_startup: Option<bool>,
+
+    /// When `true`, the interactive UI will automatically start a new session
+    /// seeded from the segment between the last two "Context compacted" events
+    /// whenever a compaction completes.
+    pub experimental_auto_new_session_on_compaction: Option<bool>,
+
+    /// When `true`, Codex will create a real `git commit` (staging all changes)
+    /// right before auto-compaction runs.
+    pub experimental_git_commit_before_compaction: Option<bool>,
     /// Preferred OSS provider for local models, e.g. "lmstudio" or "ollama".
     pub oss_provider: Option<String>,
 }
@@ -1319,6 +1349,15 @@ impl Config {
             .unwrap_or_else(default_review_model);
 
         let check_for_update_on_startup = cfg.check_for_update_on_startup.unwrap_or(true);
+        let seed_last_compaction_segment_on_startup = cfg
+            .experimental_seed_last_compaction_segment_on_startup
+            .unwrap_or(false);
+        let auto_new_session_on_compaction = cfg
+            .experimental_auto_new_session_on_compaction
+            .unwrap_or(false);
+        let git_commit_before_compaction = cfg
+            .experimental_git_commit_before_compaction
+            .unwrap_or(false);
 
         // Ensure that every field of ConfigRequirements is applied to the final
         // Config.
@@ -1431,6 +1470,9 @@ impl Config {
                 .unwrap_or_default(),
             animations: cfg.tui.as_ref().map(|t| t.animations).unwrap_or(true),
             show_tooltips: cfg.tui.as_ref().map(|t| t.show_tooltips).unwrap_or(true),
+            seed_last_compaction_segment_on_startup,
+            auto_new_session_on_compaction,
+            git_commit_before_compaction,
             tui_scroll_events_per_tick: cfg.tui.as_ref().and_then(|t| t.scroll_events_per_tick),
             tui_scroll_wheel_lines: cfg.tui.as_ref().and_then(|t| t.scroll_wheel_lines),
             tui_scroll_trackpad_lines: cfg.tui.as_ref().and_then(|t| t.scroll_trackpad_lines),
@@ -1530,15 +1572,24 @@ fn default_review_model() -> String {
     OPENAI_DEFAULT_REVIEW_MODEL.to_string()
 }
 
-/// Returns the path to the Codex configuration directory, which can be
-/// specified by the `CODEX_HOME` environment variable. If not set, defaults to
-/// `~/.codex`.
+/// Returns the path to the Codex configuration directory.
 ///
-/// - If `CODEX_HOME` is set, the value will be canonicalized and this
+/// In this fork, the directory can be specified by `CODEXX_HOME` (preferred)
+/// or `CODEX_HOME`. If neither is set, defaults to `~/.codexx`.
+///
+/// - If `CODEXX_HOME` or `CODEX_HOME` is set, the value will be canonicalized and this
 ///   function will Err if the path does not exist.
-/// - If `CODEX_HOME` is not set, this function does not verify that the
+/// - If neither `CODEXX_HOME` nor `CODEX_HOME` is set, this function does not verify that the
 ///   directory exists.
 pub fn find_codex_home() -> std::io::Result<PathBuf> {
+    // Prefer `CODEXX_HOME` to keep this fork isolated from upstream Codex when
+    // both are installed on the same machine.
+    if let Ok(val) = std::env::var("CODEXX_HOME")
+        && !val.is_empty()
+    {
+        return PathBuf::from(val).canonicalize();
+    }
+
     // Honor the `CODEX_HOME` environment variable when it is set to allow users
     // (and tests) to override the default location.
     if let Ok(val) = std::env::var("CODEX_HOME")
@@ -1553,7 +1604,7 @@ pub fn find_codex_home() -> std::io::Result<PathBuf> {
             "Could not find home directory",
         )
     })?;
-    p.push(".codex");
+    p.push(".codexx");
     Ok(p)
 }
 
@@ -2045,6 +2096,29 @@ trust_level = "trusted"
         assert!(config.include_apply_patch_tool);
 
         assert!(config.use_experimental_unified_exec_tool);
+
+        Ok(())
+    }
+
+    #[test]
+    fn past_session_seeding_flags_map_from_toml() -> std::io::Result<()> {
+        let codex_home = TempDir::new()?;
+        let cfg = ConfigToml {
+            experimental_seed_last_compaction_segment_on_startup: Some(true),
+            experimental_auto_new_session_on_compaction: Some(true),
+            experimental_git_commit_before_compaction: Some(true),
+            ..Default::default()
+        };
+
+        let config = Config::load_from_base_config_with_overrides(
+            cfg,
+            ConfigOverrides::default(),
+            codex_home.path().to_path_buf(),
+        )?;
+
+        assert!(config.seed_last_compaction_segment_on_startup);
+        assert!(config.auto_new_session_on_compaction);
+        assert!(config.git_commit_before_compaction);
 
         Ok(())
     }
@@ -3238,6 +3312,9 @@ model_verbosity = "high"
                 tui_notifications: Default::default(),
                 animations: true,
                 show_tooltips: true,
+                seed_last_compaction_segment_on_startup: false,
+                auto_new_session_on_compaction: false,
+                git_commit_before_compaction: false,
                 tui_scroll_events_per_tick: None,
                 tui_scroll_wheel_lines: None,
                 tui_scroll_trackpad_lines: None,
@@ -3323,6 +3400,9 @@ model_verbosity = "high"
             tui_notifications: Default::default(),
             animations: true,
             show_tooltips: true,
+            seed_last_compaction_segment_on_startup: false,
+            auto_new_session_on_compaction: false,
+            git_commit_before_compaction: false,
             tui_scroll_events_per_tick: None,
             tui_scroll_wheel_lines: None,
             tui_scroll_trackpad_lines: None,
@@ -3423,6 +3503,9 @@ model_verbosity = "high"
             tui_notifications: Default::default(),
             animations: true,
             show_tooltips: true,
+            seed_last_compaction_segment_on_startup: false,
+            auto_new_session_on_compaction: false,
+            git_commit_before_compaction: false,
             tui_scroll_events_per_tick: None,
             tui_scroll_wheel_lines: None,
             tui_scroll_trackpad_lines: None,
@@ -3509,6 +3592,9 @@ model_verbosity = "high"
             tui_notifications: Default::default(),
             animations: true,
             show_tooltips: true,
+            seed_last_compaction_segment_on_startup: false,
+            auto_new_session_on_compaction: false,
+            git_commit_before_compaction: false,
             tui_scroll_events_per_tick: None,
             tui_scroll_wheel_lines: None,
             tui_scroll_trackpad_lines: None,

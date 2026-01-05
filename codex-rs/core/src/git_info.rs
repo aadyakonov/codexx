@@ -1,4 +1,6 @@
+use std::collections::HashMap;
 use std::collections::HashSet;
+use std::io;
 use std::path::Path;
 use std::path::PathBuf;
 
@@ -44,6 +46,18 @@ pub fn get_git_repo_root(base_dir: &Path) -> Option<PathBuf> {
 
 /// Timeout for git commands to prevent freezing on large repositories
 const GIT_COMMAND_TIMEOUT: TokioDuration = TokioDuration::from_secs(5);
+
+/// Timeout for longer-running git commands that mutate repository state (e.g. add/commit).
+const GIT_MUTATING_COMMAND_TIMEOUT: TokioDuration = TokioDuration::from_secs(30);
+
+const AUTO_COMMIT_SUBJECT_MAX_CHARS: usize = 72;
+const AUTO_COMMIT_SUBJECT_PREFIX: &str = "checkpoint: ";
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct GitCommitOutcome {
+    pub(crate) sha: String,
+    pub(crate) subject: String,
+}
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct GitDiffToRemote {
@@ -185,8 +199,16 @@ pub async fn git_diff_to_remote(cwd: &Path) -> Option<GitDiffToRemote> {
 
 /// Run a git command with a timeout to prevent blocking on large repositories
 async fn run_git_command_with_timeout(args: &[&str], cwd: &Path) -> Option<std::process::Output> {
+    run_git_command_with_timeout_for(args, cwd, GIT_COMMAND_TIMEOUT).await
+}
+
+async fn run_git_command_with_timeout_for(
+    args: &[&str],
+    cwd: &Path,
+    timeout_duration: TokioDuration,
+) -> Option<std::process::Output> {
     let result = timeout(
-        GIT_COMMAND_TIMEOUT,
+        timeout_duration,
         Command::new("git").args(args).current_dir(cwd).output(),
     )
     .await;
@@ -195,6 +217,313 @@ async fn run_git_command_with_timeout(args: &[&str], cwd: &Path) -> Option<std::
         Ok(Ok(output)) => Some(output),
         _ => None, // Timeout or error
     }
+}
+
+pub(crate) async fn auto_checkpoint_commit_all_changes(
+    cwd: &Path,
+) -> io::Result<Option<GitCommitOutcome>> {
+    let Some(repo_root) = git_repo_root_from_git(cwd).await else {
+        return Ok(None);
+    };
+
+    let Some(status_out) = run_git_command_with_timeout_for(
+        &["status", "--porcelain"],
+        &repo_root,
+        GIT_MUTATING_COMMAND_TIMEOUT,
+    )
+    .await
+    else {
+        return Err(io::Error::other("git status timed out"));
+    };
+    if !status_out.status.success() {
+        let stderr = String::from_utf8_lossy(&status_out.stderr);
+        return Err(io::Error::other(format!("git status failed: {stderr}")));
+    }
+    if status_out.stdout.is_empty() {
+        return Ok(None);
+    }
+
+    let Some(add_out) =
+        run_git_command_with_timeout_for(&["add", "-A"], &repo_root, GIT_MUTATING_COMMAND_TIMEOUT)
+            .await
+    else {
+        return Err(io::Error::other("git add -A timed out"));
+    };
+    if !add_out.status.success() {
+        let stderr = String::from_utf8_lossy(&add_out.stderr);
+        return Err(io::Error::other(format!("git add -A failed: {stderr}")));
+    }
+
+    let Some(name_status_out) = run_git_command_with_timeout_for(
+        &["diff", "--cached", "--name-status", "-z"],
+        &repo_root,
+        GIT_MUTATING_COMMAND_TIMEOUT,
+    )
+    .await
+    else {
+        return Err(io::Error::other("git diff --cached timed out"));
+    };
+    if !name_status_out.status.success() {
+        let stderr = String::from_utf8_lossy(&name_status_out.stderr);
+        return Err(io::Error::other(format!(
+            "git diff --cached failed: {stderr}"
+        )));
+    }
+    if name_status_out.stdout.is_empty() {
+        return Ok(None);
+    }
+
+    let shortstat_out = run_git_command_with_timeout_for(
+        &["diff", "--cached", "--shortstat"],
+        &repo_root,
+        GIT_MUTATING_COMMAND_TIMEOUT,
+    )
+    .await;
+    let (insertions, deletions) = shortstat_out
+        .as_ref()
+        .and_then(|out| out.status.success().then_some(out))
+        .and_then(|out| String::from_utf8(out.stdout.clone()).ok())
+        .map(|out| parse_shortstat(&out))
+        .unwrap_or_default();
+
+    let entries = parse_name_status_z(&name_status_out.stdout);
+    let subject = build_auto_commit_subject(&entries, insertions, deletions);
+
+    let Some(commit_out) = run_git_command_with_timeout_for(
+        &[
+            "commit",
+            "-m",
+            subject.as_str(),
+            "--no-gpg-sign",
+            "--no-verify",
+        ],
+        &repo_root,
+        GIT_MUTATING_COMMAND_TIMEOUT,
+    )
+    .await
+    else {
+        return Err(io::Error::other("git commit timed out"));
+    };
+    if !commit_out.status.success() {
+        let stderr = String::from_utf8_lossy(&commit_out.stderr);
+        let stdout = String::from_utf8_lossy(&commit_out.stdout);
+        return Err(io::Error::other(format!(
+            "git commit failed: {stderr}{stdout}"
+        )));
+    }
+
+    let Some(sha_out) =
+        run_git_command_with_timeout_for(&["rev-parse", "HEAD"], &repo_root, GIT_COMMAND_TIMEOUT)
+            .await
+    else {
+        return Err(io::Error::other("git rev-parse HEAD timed out"));
+    };
+    if !sha_out.status.success() {
+        let stderr = String::from_utf8_lossy(&sha_out.stderr);
+        return Err(io::Error::other(format!(
+            "git rev-parse HEAD failed: {stderr}"
+        )));
+    }
+    let sha = String::from_utf8_lossy(&sha_out.stdout).trim().to_string();
+    Ok(Some(GitCommitOutcome { sha, subject }))
+}
+
+async fn git_repo_root_from_git(cwd: &Path) -> Option<PathBuf> {
+    let out = run_git_command_with_timeout_for(
+        &["rev-parse", "--show-toplevel"],
+        cwd,
+        GIT_COMMAND_TIMEOUT,
+    )
+    .await?;
+    if !out.status.success() {
+        return None;
+    }
+    let root = String::from_utf8(out.stdout).ok()?;
+    let trimmed = root.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(PathBuf::from(trimmed))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NameStatusEntry {
+    status: String,
+    old_path: Option<String>,
+    path: String,
+}
+
+fn parse_name_status_z(bytes: &[u8]) -> Vec<NameStatusEntry> {
+    let parts = bytes
+        .split(|b| *b == b'\0')
+        .filter(|p| !p.is_empty())
+        .map(|p| String::from_utf8_lossy(p).to_string())
+        .collect::<Vec<_>>();
+
+    let mut entries = Vec::new();
+    let mut idx = 0usize;
+    while idx < parts.len() {
+        let status = parts[idx].clone();
+        idx += 1;
+        if status.is_empty() || idx >= parts.len() {
+            break;
+        }
+
+        if status.starts_with('R') || status.starts_with('C') {
+            if idx + 1 >= parts.len() {
+                break;
+            }
+            let old_path = parts[idx].clone();
+            let new_path = parts[idx + 1].clone();
+            idx += 2;
+            entries.push(NameStatusEntry {
+                status,
+                old_path: Some(old_path),
+                path: new_path,
+            });
+            continue;
+        }
+
+        let path = parts[idx].clone();
+        idx += 1;
+        entries.push(NameStatusEntry {
+            status,
+            old_path: None,
+            path,
+        });
+    }
+    entries
+}
+
+fn parse_shortstat(text: &str) -> (usize, usize) {
+    let mut insertions = 0usize;
+    let mut deletions = 0usize;
+
+    for segment in text.trim().split(',') {
+        let segment = segment.trim();
+        if segment.is_empty() {
+            continue;
+        }
+        let mut parts = segment.split_whitespace();
+        let Some(num) = parts.next().and_then(|n| n.parse::<usize>().ok()) else {
+            continue;
+        };
+        let label = parts.next().unwrap_or_default();
+        if label.starts_with("insertion") {
+            insertions = num;
+        } else if label.starts_with("deletion") {
+            deletions = num;
+        }
+    }
+
+    (insertions, deletions)
+}
+
+fn build_auto_commit_subject(
+    entries: &[NameStatusEntry],
+    insertions: usize,
+    deletions: usize,
+) -> String {
+    let action = determine_action(entries);
+    let scope = determine_scope(entries);
+
+    let mut subject = format!("{AUTO_COMMIT_SUBJECT_PREFIX}{action} {scope}");
+    if insertions > 0 || deletions > 0 {
+        let stats = match (insertions, deletions) {
+            (0, d) => format!(" (-{d})"),
+            (i, 0) => format!(" (+{i})"),
+            (i, d) => format!(" (+{i}/-{d})"),
+        };
+        if subject.chars().count() + stats.chars().count() <= AUTO_COMMIT_SUBJECT_MAX_CHARS {
+            subject.push_str(&stats);
+        }
+    }
+
+    truncate_subject(subject, AUTO_COMMIT_SUBJECT_MAX_CHARS)
+}
+
+fn determine_action(entries: &[NameStatusEntry]) -> &'static str {
+    if entries.is_empty() {
+        return "update";
+    }
+
+    let all_added = entries.iter().all(|e| e.status.starts_with('A'));
+    let all_deleted = entries.iter().all(|e| e.status.starts_with('D'));
+    let all_renamed = entries.iter().all(|e| e.status.starts_with('R'));
+
+    if all_added {
+        "add"
+    } else if all_deleted {
+        "remove"
+    } else if all_renamed {
+        "rename"
+    } else {
+        "update"
+    }
+}
+
+fn determine_scope(entries: &[NameStatusEntry]) -> String {
+    if entries.is_empty() {
+        return "repo".to_string();
+    }
+
+    if entries.len() == 1 {
+        let entry = &entries[0];
+        return format_single_entry_scope(entry);
+    }
+
+    let mut top_dir_counts: HashMap<String, usize> = HashMap::new();
+    for entry in entries {
+        let path = entry.path.replace('\\', "/");
+        let top = if path.contains('/') {
+            path.split('/').next().unwrap_or("repo")
+        } else {
+            "repo"
+        }
+        .to_string();
+        *top_dir_counts.entry(top).or_insert(0) += 1;
+    }
+
+    let (primary_dir, _count) = top_dir_counts
+        .into_iter()
+        .max_by(|(a_dir, a_count), (b_dir, b_count)| {
+            a_count.cmp(b_count).then_with(|| b_dir.cmp(a_dir))
+        })
+        .unwrap_or(("repo".to_string(), 0));
+
+    let primary_dir = if primary_dir.is_empty() {
+        "repo".to_string()
+    } else {
+        primary_dir
+    };
+    format!("{primary_dir} ({count} files)", count = entries.len())
+}
+
+fn format_single_entry_scope(entry: &NameStatusEntry) -> String {
+    let path = entry.path.replace('\\', "/");
+    let parts = path.split('/').collect::<Vec<_>>();
+    match parts.len() {
+        0 => "repo".to_string(),
+        1 => parts[0].to_string(),
+        _ => format!("{}/{}", parts[parts.len() - 2], parts[parts.len() - 1]),
+    }
+}
+
+fn truncate_subject(subject: String, max_chars: usize) -> String {
+    let trimmed = subject.trim();
+    if trimmed.chars().count() <= max_chars {
+        return trimmed.to_string();
+    }
+
+    let mut out = String::new();
+    for (idx, ch) in trimmed.chars().enumerate() {
+        if idx >= max_chars {
+            break;
+        }
+        out.push(ch);
+    }
+    out.trim_end().to_string()
 }
 
 async fn get_git_remotes(cwd: &Path) -> Option<Vec<String>> {
@@ -661,6 +990,48 @@ mod tests {
             .expect("Failed to commit");
 
         repo_path
+    }
+
+    #[tokio::test]
+    async fn auto_checkpoint_commit_creates_real_commit_with_staged_changes() {
+        skip_if_sandbox!();
+
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let repo_path = create_test_git_repo(&temp_dir).await;
+
+        // Introduce both a modification and a new file so we exercise `git add -A`.
+        fs::write(repo_path.join("test.txt"), "updated content").expect("write updated file");
+        fs::write(repo_path.join("added.txt"), "new file").expect("write new file");
+
+        let outcome = auto_checkpoint_commit_all_changes(&repo_path)
+            .await
+            .expect("auto commit")
+            .expect("expected a commit to be created");
+        assert!(outcome.subject.starts_with(AUTO_COMMIT_SUBJECT_PREFIX));
+        assert!(!outcome.sha.is_empty());
+
+        // Ensure the working tree is clean after committing.
+        let status_out = Command::new("git")
+            .args(["status", "--porcelain"])
+            .current_dir(&repo_path)
+            .output()
+            .await
+            .expect("git status");
+        assert!(status_out.status.success());
+        assert!(status_out.stdout.is_empty());
+
+        // Ensure the subject matches HEAD.
+        let log_out = Command::new("git")
+            .args(["log", "-1", "--pretty=%s"])
+            .current_dir(&repo_path)
+            .output()
+            .await
+            .expect("git log");
+        assert!(log_out.status.success());
+        assert_eq!(
+            String::from_utf8_lossy(&log_out.stdout).trim(),
+            outcome.subject
+        );
     }
 
     #[tokio::test]

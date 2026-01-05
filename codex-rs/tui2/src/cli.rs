@@ -15,6 +15,11 @@ pub struct Cli {
     #[arg(long = "image", short = 'i', value_name = "FILE", value_delimiter = ',', num_args = 1..)]
     pub images: Vec<PathBuf>,
 
+    /// Start the session by seeding history from the segment between the last two
+    /// "Context compacted" events in the most recent recorded rollout.
+    #[arg(long = "seed-last-compaction-segment", default_value_t = false)]
+    pub seed_last_compaction_segment: bool,
+
     // Internal controls set by the top-level `codex resume` subcommand.
     // These are not exposed as user flags on the base `codex` command.
     #[clap(skip)]
@@ -94,6 +99,7 @@ impl From<codex_tui::Cli> for Cli {
         Self {
             prompt: cli.prompt,
             images: cli.images,
+            seed_last_compaction_segment: cli.seed_last_compaction_segment,
             resume_picker: cli.resume_picker,
             resume_last: cli.resume_last,
             resume_session_id: cli.resume_session_id,

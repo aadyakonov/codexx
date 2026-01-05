@@ -1,5 +1,6 @@
 use super::*;
 use crate::app_event::AppEvent;
+use crate::app_event::NewSessionSeed;
 use crate::app_event_sender::AppEventSender;
 use crate::test_backend::VT100Backend;
 use crate::tui::FrameRequester;
@@ -147,6 +148,55 @@ async fn resumed_initial_messages_render_history() {
     assert!(
         text_blob.contains("assistant reply"),
         "expected replayed agent message",
+    );
+}
+
+#[tokio::test]
+async fn context_compacted_event_can_auto_start_new_session_seeded() {
+    let (mut chat, mut rx, _ops) = make_chatwidget_manual(None).await;
+    chat.config.auto_new_session_on_compaction = true;
+
+    let conversation_id = ConversationId::new();
+    let rollout_file = NamedTempFile::new().unwrap();
+    let rollout_path = rollout_file.path().to_path_buf();
+    let configured = codex_core::protocol::SessionConfiguredEvent {
+        session_id: conversation_id,
+        model: "test-model".to_string(),
+        model_provider_id: "test-provider".to_string(),
+        approval_policy: AskForApproval::Never,
+        sandbox_policy: SandboxPolicy::ReadOnly,
+        cwd: PathBuf::from("/home/user/project"),
+        reasoning_effort: Some(ReasoningEffortConfig::default()),
+        history_log_id: 0,
+        history_entry_count: 0,
+        initial_messages: None,
+        rollout_path: rollout_path.clone(),
+    };
+    chat.handle_codex_event(Event {
+        id: "".to_string(),
+        msg: EventMsg::SessionConfigured(configured),
+    });
+
+    // Discard any startup UI events.
+    while rx.try_recv().is_ok() {}
+
+    chat.handle_codex_event(Event {
+        id: "compaction".to_string(),
+        msg: EventMsg::ContextCompacted(codex_core::protocol::ContextCompactedEvent {}),
+    });
+
+    let mut saw_new_session = None;
+    while let Ok(ev) = rx.try_recv() {
+        if let AppEvent::NewSession { seed } = ev {
+            saw_new_session = Some(seed);
+            break;
+        }
+    }
+
+    assert_matches!(
+        saw_new_session,
+        Some(NewSessionSeed::LastCompactionSegment { source_rollout_path })
+            if source_rollout_path == Some(rollout_path)
     );
 }
 
@@ -328,6 +378,7 @@ async fn helpers_are_available_and_do_not_panic() {
         feedback: codex_feedback::CodexFeedback::new(),
         is_first_run: true,
         model: resolved_model,
+        new_session_seed: NewSessionSeed::None,
     };
     let mut w = ChatWidget::new(init, conversation_manager);
     // Basic construction sanity.

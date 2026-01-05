@@ -61,7 +61,7 @@ pub(crate) async fn run_compact_task(
     run_compact_task_inner(sess.clone(), turn_context, input).await;
 }
 
-async fn run_compact_task_inner(
+pub(crate) async fn run_compact_task_inner(
     sess: Arc<Session>,
     turn_context: Arc<TurnContext>,
     input: Vec<UserInput>,

@@ -1,5 +1,6 @@
 use crate::app_backtrack::BacktrackState;
 use crate::app_event::AppEvent;
+use crate::app_event::NewSessionSeed;
 use crate::app_event_sender::AppEventSender;
 use crate::bottom_pane::ApprovalRequest;
 use crate::chatwidget::ChatWidget;
@@ -379,6 +380,7 @@ impl App {
         initial_prompt: Option<String>,
         initial_images: Vec<PathBuf>,
         resume_selection: ResumeSelection,
+        seed_last_compaction_segment: bool,
         feedback: codex_feedback::CodexFeedback,
         is_first_run: bool,
     ) -> Result<AppExitInfo> {
@@ -410,6 +412,13 @@ impl App {
         }
 
         let enhanced_keys_supported = tui.enhanced_keys_supported();
+        let startup_seed = if seed_last_compaction_segment {
+            NewSessionSeed::LastCompactionSegment {
+                source_rollout_path: None,
+            }
+        } else {
+            NewSessionSeed::None
+        };
         let mut chat_widget = match resume_selection {
             ResumeSelection::StartFresh | ResumeSelection::Exit => {
                 let init = crate::chatwidget::ChatWidgetInit {
@@ -424,6 +433,7 @@ impl App {
                     feedback: feedback.clone(),
                     is_first_run,
                     model: model.clone(),
+                    new_session_seed: startup_seed.clone(),
                 };
                 ChatWidget::new(init, conversation_manager.clone())
             }
@@ -450,6 +460,7 @@ impl App {
                     feedback: feedback.clone(),
                     is_first_run,
                     model: model.clone(),
+                    new_session_seed: NewSessionSeed::None,
                 };
                 ChatWidget::new_from_existing(
                     init,
@@ -1325,7 +1336,7 @@ impl App {
 
     async fn handle_event(&mut self, tui: &mut tui::Tui, event: AppEvent) -> Result<bool> {
         match event {
-            AppEvent::NewSession => {
+            AppEvent::NewSession { seed } => {
                 let summary = session_summary(
                     self.chat_widget.token_usage(),
                     self.chat_widget.conversation_id(),
@@ -1343,6 +1354,7 @@ impl App {
                     feedback: self.feedback.clone(),
                     is_first_run: false,
                     model: self.current_model.clone(),
+                    new_session_seed: seed,
                 };
                 self.chat_widget = ChatWidget::new(init, self.server.clone());
                 if let Some(summary) = summary {
@@ -1392,6 +1404,7 @@ impl App {
                                     feedback: self.feedback.clone(),
                                     is_first_run: false,
                                     model: self.current_model.clone(),
+                                    new_session_seed: NewSessionSeed::None,
                                 };
                                 self.chat_widget = ChatWidget::new_from_existing(
                                     init,

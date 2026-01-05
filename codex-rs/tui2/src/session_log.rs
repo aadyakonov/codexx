@@ -12,6 +12,7 @@ use serde::Serialize;
 use serde_json::json;
 
 use crate::app_event::AppEvent;
+use crate::app_event::NewSessionSeed;
 
 static LOGGER: LazyLock<SessionLogger> = LazyLock::new(SessionLogger::new);
 
@@ -128,11 +129,16 @@ pub(crate) fn log_inbound_app_event(event: &AppEvent) {
         AppEvent::CodexEvent(ev) => {
             write_record("to_tui", "codex_event", ev);
         }
-        AppEvent::NewSession => {
+        AppEvent::NewSession { seed } => {
+            let seed = match seed {
+                NewSessionSeed::None => "none",
+                NewSessionSeed::LastCompactionSegment { .. } => "last_compaction_segment",
+            };
             let value = json!({
                 "ts": now_ts(),
                 "dir": "to_tui",
                 "kind": "new_session",
+                "seed": seed,
             });
             LOGGER.write_json_line(value);
         }

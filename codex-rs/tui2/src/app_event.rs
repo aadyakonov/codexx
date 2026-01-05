@@ -20,7 +20,9 @@ pub(crate) enum AppEvent {
     CodexEvent(Event),
 
     /// Start a new session.
-    NewSession,
+    NewSession {
+        seed: NewSessionSeed,
+    },
 
     /// Open the resume picker inside the running TUI session.
     OpenResumePicker,
@@ -174,6 +176,14 @@ pub(crate) enum AppEvent {
     /// Open the upload consent popup for feedback after selecting a category.
     OpenFeedbackConsent {
         category: FeedbackCategory,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum NewSessionSeed {
+    None,
+    LastCompactionSegment {
+        source_rollout_path: Option<PathBuf>,
     },
 }
 

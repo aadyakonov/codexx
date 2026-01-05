@@ -509,7 +509,14 @@ async fn run_ratatui_app(
         resume_picker::ResumeSelection::StartFresh
     };
 
-    let Cli { prompt, images, .. } = cli;
+    let Cli {
+        prompt,
+        images,
+        seed_last_compaction_segment,
+        ..
+    } = cli;
+    let seed_last_compaction_segment =
+        seed_last_compaction_segment || config.seed_last_compaction_segment_on_startup;
 
     // Run the main chat + transcript UI on the terminal's alternate screen so
     // the entire viewport can be used without polluting normal scrollback. This
@@ -525,6 +532,7 @@ async fn run_ratatui_app(
         prompt,
         images,
         resume_selection,
+        seed_last_compaction_segment,
         feedback,
         should_show_trust_screen, // Proxy to: is it a first run in this directory?
     )

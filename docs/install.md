@@ -47,14 +47,47 @@ just test
 cargo test --all-features
 ```
 
+### Install as `codexx` (recommended for this fork)
+
+The Rust workspace binary is still named `codex`, but you can install it under a separate name so upstream `codex` remains untouched:
+
+macOS (Homebrew prefix):
+
+```bash
+cd codex-rs
+cargo build -p codex-cli --bin codex --release
+install -m 755 target/release/codex /opt/homebrew/bin/codexx
+```
+
+Linux (common prefix):
+
+```bash
+cd codex-rs
+cargo build -p codex-cli --bin codex --release
+sudo install -m 755 target/release/codex /usr/local/bin/codexx
+```
+
+To keep configs/sessions isolated from upstream `codex`, prefer setting `CODEXX_HOME` (not `CODEX_HOME`):
+
+```bash
+mkdir -p ~/.codexx
+CODEXX_HOME="$HOME/.codexx" codexx
+```
+
+Optional `~/.zshrc` alias:
+
+```bash
+alias codexx='env CODEXX_HOME="$HOME/.codexx" codexx'
+```
+
 ## Tracing / verbose logging
 
 Codex is written in Rust, so it honors the `RUST_LOG` environment variable to configure its logging behavior.
 
-The TUI defaults to `RUST_LOG=codex_core=info,codex_tui=info,codex_rmcp_client=info` and log messages are written to `~/.codex/log/codex-tui.log`, so you can leave the following running in a separate terminal to monitor log messages as they are written:
+The TUI defaults to `RUST_LOG=codex_core=info,codex_tui=info,codex_rmcp_client=info` and log messages are written to `~/.codexx/log/codex-tui.log` (or `$CODEXX_HOME/log/codex-tui.log`), so you can leave the following running in a separate terminal to monitor log messages as they are written:
 
 ```bash
-tail -F ~/.codex/log/codex-tui.log
+tail -F ~/.codexx/log/codex-tui.log
 ```
 
 By comparison, the non-interactive mode (`codex exec`) defaults to `RUST_LOG=error`, but messages are printed inline, so there is no need to monitor a separate file.
