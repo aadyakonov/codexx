@@ -109,3 +109,106 @@ If you don’t have the tool:
   let request = mock.single_request();
   // assert using request.function_call_output(call_id) or request.json_body() or other helpers.
   ```
+
+---
+
+## Codexx fork work log (2026-01-06)
+
+### What changed (high level)
+
+Goal: align auto-compaction triggers with the UI “% left” indicator and reduce noisy remote-compaction failures.
+
+- Added a new config key to trigger auto-compaction based on **percent remaining** (`% left`), matching `/status` semantics.
+- Made **remote compaction** failures fall back to **local** compaction with a background message (instead of emitting a loud error event).
+
+### Files touched (currently uncommitted in `codexx`)
+
+- `codex-rs/core/src/config/mod.rs`
+  - Adds `model_auto_compact_context_window_remaining_percent` to `ConfigToml` + `Config`.
+  - Validates `0..=100` and enforces mutual exclusion with `model_auto_compact_context_window_percent`.
+  - Wires the new field through config loading; updates config precedence tests’ expected structs.
+- `codex-rs/core/src/codex.rs`
+  - Uses `model_auto_compact_context_window_remaining_percent` (if set) to compute `auto_compact_limit` in tokens.
+  - Uses the same baseline as `/status` so “10% left” means what it says.
+- `codex-rs/protocol/src/protocol.rs`
+  - Exports `CONTEXT_WINDOW_BASELINE_TOKENS` (12k) so the “% left” trigger can match the UI baseline.
+  - Updates doc comments to reference the new constant name.
+- `codex-rs/core/src/compact_remote.rs`
+  - On remote compaction failure, always falls back to local compaction and reports via `BackgroundEvent`.
+  - Classifies “invalid request” (400/422) to produce a clearer prefix (“rejected” vs “failed”).
+- `codex-rs/core/src/shell.rs`
+  - Test-only fix to avoid a `cargo clippy --fix` bad rewrite (`PathBuf == &str`); uses `shell_path.as_path() == Path::new("...")`.
+- `docs/config.md`
+  - Documents `model_auto_compact_context_window_remaining_percent` and clarifies “% used” vs “% left”.
+- `AGENTS.md`
+  - Adds this work log / handoff section.
+
+### New / relevant configuration keys (Codexx)
+
+- `model_auto_compact_context_window_remaining_percent = <0..=100>`
+  - Auto-compacts when “% left” (as shown in `/status`) is **<= this value**.
+  - `<= 0` disables this trigger.
+  - Mutually exclusive with `model_auto_compact_context_window_percent`.
+- Existing/related knobs already in the fork:
+  - `model_auto_compact_token_limit = 0` (or any `<= 0`) disables auto-compaction entirely.
+  - `experimental_compact_prompt_file = "./compact.md"` replaces the built-in compaction prompt; file is re-read each compaction.
+  - `experimental_seed_last_compaction_segment_on_startup = true` seeds new sessions from the last pre-compaction segment and writes `past_session.jsonl` under `$CODEXX_HOME`.
+  - `experimental_auto_new_session_on_compaction = true` starts a new seeded session after each compaction (interactive UI only).
+  - `experimental_git_commit_before_compaction = true` stages + commits right before **auto-compaction** runs (best-effort).
+  - `[features].remote_compaction = false` forces **local** compaction (avoids `/responses/compact`).
+
+### Commands run (this work session)
+
+Formatting / lint:
+
+- `cd codexx/codex-rs && just fmt`
+- `cd codexx/codex-rs && just fix -p codex-core`
+- `cd codexx/codex-rs && just fix -p codex-protocol`
+
+Tests:
+
+- `cd codexx/codex-rs && cargo test -p codex-core` (passed; 671 tests)
+- `cd codexx/codex-rs && cargo test -p codex-core auto_compact_remaining_percent` (passed; 3 tests)
+- `cd codexx/codex-rs && cargo test -p codex-protocol` (passed; 19 tests)
+
+Release build:
+
+- `cd codexx/codex-rs && cargo build -p codex-cli --bin codex --release` (succeeded; `codex-tui`/`codex-tui2` warn about `unused_assignments` in `renderable.rs`)
+
+Inspecting diffs:
+
+- `cd codexx && git status -sb`
+- `cd codexx && git diff`
+
+### Build / install / deploy (macOS + Linux)
+
+The Rust workspace binary is built as `codex` (crate `codex-cli`). To keep this fork isolated from upstream `codex`, install it under a different name (`codexx`) and use `CODEXX_HOME`.
+
+macOS (Homebrew prefix):
+
+- `cd codexx/codex-rs`
+- `cargo build -p codex-cli --bin codex --release`
+- `install -m 755 target/release/codex /opt/homebrew/bin/codexx`
+
+Linux (common prefix):
+
+- `cd codexx/codex-rs`
+- `cargo build -p codex-cli --bin codex --release`
+- `sudo install -m 755 target/release/codex /usr/local/bin/codexx`
+
+Run isolated from upstream:
+
+- Prefer `CODEXX_HOME` (not `CODEX_HOME`) so upstream `codex` and this fork don’t share configs/sessions:
+  - `CODEXX_HOME="$HOME/.codexx" codexx`
+
+Optional `~/.zshrc` alias:
+
+```sh
+alias codexx='env CODEXX_HOME="$HOME/.codexx" codexx'
+```
+
+### Notes / pitfalls encountered
+
+- `just fmt` prints warnings about `imports_granularity=Item` being nightly-only; formatting still completes on stable Rust.
+- `just fix -p codex-core` initially failed due to a clippy `--fix` rewrite in `core/src/shell.rs`; fixed by comparing via `Path`/`as_path()`.
+- If you reuse `CODEX_HOME` between upstream `codex` and `codexx`, configs can “bleed” between them. Use `CODEXX_HOME` to keep them independent.

@@ -12,6 +12,7 @@ use crate::protocol::RolloutItem;
 use crate::protocol::TaskStartedEvent;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::user_input::UserInput;
+use reqwest::StatusCode;
 
 pub(crate) async fn run_inline_remote_auto_compact_task(
     sess: Arc<Session>,
@@ -44,26 +45,33 @@ async fn run_remote_compact_task_inner(
     if let Err(err) =
         run_remote_compact_task_inner_impl(sess, turn_context, &compact_instructions).await
     {
-        if matches!(err, CodexErr::InvalidRequest(_)) {
-            sess.notify_background_event(
-                turn_context.as_ref(),
-                format!("Remote compaction failed; falling back to local compaction: {err}"),
-            )
-            .await;
-            crate::compact::run_compact_task_inner(
-                Arc::clone(sess),
-                Arc::clone(turn_context),
-                vec![UserInput::Text {
-                    text: compact_instructions,
-                }],
-            )
-            .await;
+        let prefix = if is_remote_compaction_invalid_request(&err) {
+            "Remote compaction rejected the request; falling back to local compaction"
         } else {
-            let event = EventMsg::Error(
-                err.to_error_event(Some("Error running remote compact task".to_string())),
-            );
-            sess.send_event(turn_context, event).await;
-        }
+            "Remote compaction failed; falling back to local compaction"
+        };
+
+        sess.notify_background_event(turn_context.as_ref(), format!("{prefix}: {err}"))
+            .await;
+        crate::compact::run_compact_task_inner(
+            Arc::clone(sess),
+            Arc::clone(turn_context),
+            vec![UserInput::Text {
+                text: compact_instructions,
+            }],
+        )
+        .await;
+    }
+}
+
+fn is_remote_compaction_invalid_request(err: &CodexErr) -> bool {
+    match err {
+        CodexErr::InvalidRequest(_) => true,
+        CodexErr::UnexpectedStatus(unexpected) => matches!(
+            unexpected.status,
+            StatusCode::BAD_REQUEST | StatusCode::UNPROCESSABLE_ENTITY
+        ),
+        _ => false,
     }
 }
 

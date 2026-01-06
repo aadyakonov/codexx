@@ -118,6 +118,15 @@ pub struct Config {
     /// Values `<= 0` disable auto-compaction.
     pub model_auto_compact_context_window_percent: Option<i64>,
 
+    /// Auto-compaction trigger as a percentage of the model context window **remaining**.
+    ///
+    /// This setting is applied only when `model_auto_compact_token_limit` is unset.
+    /// Values `<= 0` disable auto-compaction.
+    ///
+    /// This value uses the same baseline logic as the `/status` "percent left"
+    /// display, so it aligns with what you see in the UI.
+    pub model_auto_compact_context_window_remaining_percent: Option<i64>,
+
     /// Key into the model_providers map that specifies which provider to use.
     pub model_provider_id: String,
 
@@ -715,6 +724,12 @@ pub struct ConfigToml {
     /// This setting is applied only when `model_auto_compact_token_limit` is unset.
     /// Values `<= 0` disable auto-compaction.
     pub model_auto_compact_context_window_percent: Option<i64>,
+
+    /// Auto-compaction trigger as a percentage of the model context window **remaining**.
+    ///
+    /// This setting is applied only when `model_auto_compact_token_limit` is unset.
+    /// Values `<= 0` disable auto-compaction.
+    pub model_auto_compact_context_window_remaining_percent: Option<i64>,
 
     /// Default approval policy for executing commands.
     pub approval_policy: Option<AskForApproval>,
@@ -1382,6 +1397,28 @@ impl Config {
             ));
         }
 
+        if let Some(percent) = cfg.model_auto_compact_context_window_remaining_percent
+            && percent > 100
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "model_auto_compact_context_window_remaining_percent must be <= 100, got {percent}"
+                ),
+            ));
+        }
+
+        if cfg.model_auto_compact_context_window_percent.is_some()
+            && cfg
+                .model_auto_compact_context_window_remaining_percent
+                .is_some()
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Only one of model_auto_compact_context_window_percent or model_auto_compact_context_window_remaining_percent may be set.",
+            ));
+        }
+
         let config = Self {
             model,
             review_model,
@@ -1389,6 +1426,8 @@ impl Config {
             model_auto_compact_token_limit: cfg.model_auto_compact_token_limit,
             model_auto_compact_context_window_percent: cfg
                 .model_auto_compact_context_window_percent,
+            model_auto_compact_context_window_remaining_percent: cfg
+                .model_auto_compact_context_window_remaining_percent,
             model_provider_id,
             model_provider,
             cwd: resolved_cwd,
@@ -2120,6 +2159,69 @@ trust_level = "trusted"
         assert!(config.auto_new_session_on_compaction);
         assert!(config.git_commit_before_compaction);
 
+        Ok(())
+    }
+
+    #[test]
+    fn auto_compact_remaining_percent_maps_from_toml() -> std::io::Result<()> {
+        let codex_home = TempDir::new()?;
+        let cfg = ConfigToml {
+            model_auto_compact_context_window_remaining_percent: Some(10),
+            ..Default::default()
+        };
+
+        let config = Config::load_from_base_config_with_overrides(
+            cfg,
+            ConfigOverrides::default(),
+            codex_home.path().to_path_buf(),
+        )?;
+
+        assert_eq!(
+            config.model_auto_compact_context_window_remaining_percent,
+            Some(10)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn auto_compact_remaining_percent_rejects_over_100() -> std::io::Result<()> {
+        let codex_home = TempDir::new()?;
+        let cfg = ConfigToml {
+            model_auto_compact_context_window_remaining_percent: Some(101),
+            ..Default::default()
+        };
+
+        let err = Config::load_from_base_config_with_overrides(
+            cfg,
+            ConfigOverrides::default(),
+            codex_home.path().to_path_buf(),
+        )
+        .expect_err("expected config load error");
+        assert!(
+            err.to_string()
+                .contains("model_auto_compact_context_window_remaining_percent must be <= 100")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn auto_compact_remaining_percent_conflicts_with_percent_used() -> std::io::Result<()> {
+        let codex_home = TempDir::new()?;
+        let cfg = ConfigToml {
+            model_auto_compact_context_window_percent: Some(50),
+            model_auto_compact_context_window_remaining_percent: Some(10),
+            ..Default::default()
+        };
+
+        let err = Config::load_from_base_config_with_overrides(
+            cfg,
+            ConfigOverrides::default(),
+            codex_home.path().to_path_buf(),
+        )
+        .expect_err("expected config load error");
+        assert!(err.to_string().contains(
+            "Only one of model_auto_compact_context_window_percent or model_auto_compact_context_window_remaining_percent may be set."
+        ));
         Ok(())
     }
 
@@ -3263,6 +3365,7 @@ model_verbosity = "high"
                 model_context_window: None,
                 model_auto_compact_token_limit: None,
                 model_auto_compact_context_window_percent: None,
+                model_auto_compact_context_window_remaining_percent: None,
                 model_provider_id: "openai".to_string(),
                 model_provider: fixture.openai_provider.clone(),
                 approval_policy: Constrained::allow_any(AskForApproval::Never),
@@ -3351,6 +3454,7 @@ model_verbosity = "high"
             model_context_window: None,
             model_auto_compact_token_limit: None,
             model_auto_compact_context_window_percent: None,
+            model_auto_compact_context_window_remaining_percent: None,
             model_provider_id: "openai-chat-completions".to_string(),
             model_provider: fixture.openai_chat_completions_provider.clone(),
             approval_policy: Constrained::allow_any(AskForApproval::UnlessTrusted),
@@ -3454,6 +3558,7 @@ model_verbosity = "high"
             model_context_window: None,
             model_auto_compact_token_limit: None,
             model_auto_compact_context_window_percent: None,
+            model_auto_compact_context_window_remaining_percent: None,
             model_provider_id: "openai".to_string(),
             model_provider: fixture.openai_provider.clone(),
             approval_policy: Constrained::allow_any(AskForApproval::OnFailure),
@@ -3543,6 +3648,7 @@ model_verbosity = "high"
             model_context_window: None,
             model_auto_compact_token_limit: None,
             model_auto_compact_context_window_percent: None,
+            model_auto_compact_context_window_remaining_percent: None,
             model_provider_id: "openai".to_string(),
             model_provider: fixture.openai_provider.clone(),
             approval_policy: Constrained::allow_any(AskForApproval::OnFailure),

@@ -14,8 +14,11 @@ This fork adds a few additional `config.toml` keys:
 # Use a custom prompt file for compaction (re-read each compaction).
 experimental_compact_prompt_file = "./compact.md"
 
-# Auto-compact at % of context window (<= 0 disables).
-model_auto_compact_context_window_percent = 50
+# Auto-compact when N% of the context window is used (<= 0 disables). (Legacy)
+# model_auto_compact_context_window_percent = 50
+
+# Auto-compact when only N% of the context window is left (<= 0 disables). (Recommended)
+model_auto_compact_context_window_remaining_percent = 10
 
 # Seed new sessions from the last pre-compaction segment and optionally auto-start a new one after compaction.
 experimental_seed_last_compaction_segment_on_startup = true
@@ -30,8 +33,10 @@ experimental_git_commit_before_compaction = true
 - `experimental_compact_prompt_file` **replaces** Codex’s built-in compaction prompt (it is not appended).
   - It is re-read on every compaction so you can edit `compact.md` mid-session.
   - If the file is empty or can’t be read, Codexx falls back to the cached/built-in prompt.
-- `model_auto_compact_context_window_percent` is **percent used**, not percent remaining.
-  - Example: “compact when **10% left**” ⇒ set `model_auto_compact_context_window_percent = 90`.
+- Auto-compaction thresholds:
+  - `model_auto_compact_context_window_percent` is **percent used** (legacy).
+  - `model_auto_compact_context_window_remaining_percent` is **percent left** (recommended).
+  - Only one of those two can be set at a time.
   - To fully disable auto-compaction, set `model_auto_compact_token_limit = 0` (or any `<= 0` value).
 - Relative paths like `./compact.md` are resolved relative to the folder containing the `config.toml` that defined them (e.g. `~/.codexx/config.toml` or `<repo>/.codexx/config.toml`).
 - To keep upstream `codex` and this fork isolated, use `CODEXX_HOME` (preferred) instead of `CODEX_HOME`.

@@ -32,6 +32,7 @@ use async_channel::Sender;
 use codex_protocol::ConversationId;
 use codex_protocol::approvals::ExecPolicyAmendment;
 use codex_protocol::items::TurnItem;
+use codex_protocol::protocol::CONTEXT_WINDOW_BASELINE_TOKENS;
 use codex_protocol::protocol::FileChange;
 use codex_protocol::protocol::HasLegacyEvent;
 use codex_protocol::protocol::ItemCompletedEvent;
@@ -2266,6 +2267,28 @@ pub(crate) async fn run_task(
     let config = turn_context.client.config();
     let auto_compact_limit = if let Some(limit) = config.model_auto_compact_token_limit {
         if limit <= 0 { None } else { Some(limit) }
+    } else if let Some(percent_remaining) =
+        config.model_auto_compact_context_window_remaining_percent
+    {
+        if percent_remaining <= 0 {
+            None
+        } else {
+            turn_context
+                .client
+                .get_model_context_window()
+                .map(|window| {
+                    if window <= CONTEXT_WINDOW_BASELINE_TOKENS {
+                        window.max(1)
+                    } else {
+                        let effective_window = window - CONTEXT_WINDOW_BASELINE_TOKENS;
+                        let used_percent = (100 - percent_remaining.clamp(0, 100)).clamp(0, 100);
+                        let used_tokens = effective_window.saturating_mul(used_percent) / 100;
+                        CONTEXT_WINDOW_BASELINE_TOKENS
+                            .saturating_add(used_tokens)
+                            .max(1)
+                    }
+                })
+        }
     } else if let Some(percent) = config.model_auto_compact_context_window_percent {
         if percent <= 0 {
             None
