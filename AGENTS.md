@@ -1,3 +1,14 @@
+# Must do on start of session
+Start of session:
+1. file compacting.done is existing
+2. Must read last file session_hh_mm_X_dd_mm_yyyy.md(GMT+8)
+3. Delete file compacting.done
+4. If file non_stop.run exist - proceed with task till its completion without any intermediate reports to user, if non_stop.run file is not existing - make summary of planned further work and why and wait user instructions
+5. delete file compacting.done
+
+# Your role
+I'm your manager, you are a lead developer - I don't care how you achieve objectives. You must deliver me working solution, and you are not junior developer, but lead - I'm expecting full autonomity, and proper deep reserach work to be done to make it working BEFORE any implementation. Don't bother me with details, report when it's done only or hard blocker faced. It's your responsibility to relentlessly work  till soliution works, if you face issues you couldn't fix on your own - must do web search for solutions and iteratively implement them
+
 # Rust/codex-rs
 
 In the codex-rs folder where the rust code lives:
@@ -13,7 +24,6 @@ In the codex-rs folder where the rust code lives:
 - Use method references over closures when possible per https://rust-lang.github.io/rust-clippy/master/index.html#redundant_closure_for_method_calls
 - When writing tests, prefer comparing the equality of entire objects over fields one by one.
 - When making a change that adds or changes an API, ensure that the documentation in the `docs/` folder is up to date if applicable.
-- If you change `ConfigToml` or nested config types, run `just write-config-schema` to update `codex-rs/core/config.schema.json`.
 
 Run `just fmt` (in `codex-rs` directory) automatically after making Rust code changes; do not ask for approval to run it. Before finalizing a change to `codex-rs`, run `just fix -p <project>` (in `codex-rs` directory) to fix any linter issues in the code. Prefer scoping with `-p` to avoid slow workspace‑wide Clippy builds; only run `just fix` without `-p` if you changed shared crates. Additionally, run the tests:
 
@@ -78,11 +88,11 @@ If you don’t have the tool:
 - Prefer deep equals comparisons whenever possible. Perform `assert_eq!()` on entire objects, rather than individual fields.
 - Avoid mutating process environment in tests; prefer passing environment-derived flags or dependencies from above.
 
-### Spawning workspace binaries in tests (Cargo vs Bazel)
+### Spawning workspace binaries in tests (Cargo vs Buck2)
 
 - Prefer `codex_utils_cargo_bin::cargo_bin("...")` over `assert_cmd::Command::cargo_bin(...)` or `escargot` when tests need to spawn first-party binaries.
-  - Under Bazel, binaries and resources may live under runfiles; use `codex_utils_cargo_bin::cargo_bin` to resolve absolute paths that remain stable after `chdir`.
-- When locating fixture files or test resources under Bazel, avoid `env!("CARGO_MANIFEST_DIR")`. Prefer `codex_utils_cargo_bin::find_resource!` so paths resolve correctly under both Cargo and Bazel runfiles.
+  - Under Buck2, `CARGO_BIN_EXE_*` may be project-relative (e.g. `buck-out/...`), which breaks if a test changes its working directory. `codex_utils_cargo_bin::cargo_bin` resolves to an absolute path first.
+- When locating fixture files under Buck2, avoid `env!("CARGO_MANIFEST_DIR")` (Buck codegen sets it to `"."`). Prefer deriving paths from `codex_utils_cargo_bin::buck_project_root()` when needed.
 
 ### Integration tests (core)
 
@@ -110,3 +120,142 @@ If you don’t have the tool:
   let request = mock.single_request();
   // assert using request.function_call_output(call_id) or request.json_body() or other helpers.
   ```
+
+---
+
+## Codexx fork work log (2026-01-06)
+
+Status: archived (these changes were discarded on 2026-01-15 when the repo was reset to upstream `rust-v0.84.0`).
+
+### What changed (high level)
+
+Goal: align auto-compaction triggers with the UI “% left” indicator and reduce noisy remote-compaction failures.
+
+- Added a new config key to trigger auto-compaction based on **percent remaining** (`% left`), matching `/status` semantics.
+- Made **remote compaction** failures fall back to **local** compaction with a background message (instead of emitting a loud error event).
+
+### Files touched (currently uncommitted in `codexx`)
+
+- `codex-rs/core/src/config/mod.rs`
+  - Adds `model_auto_compact_context_window_remaining_percent` to `ConfigToml` + `Config`.
+  - Validates `0..=100` and enforces mutual exclusion with `model_auto_compact_context_window_percent`.
+  - Wires the new field through config loading; updates config precedence tests’ expected structs.
+- `codex-rs/core/src/codex.rs`
+  - Uses `model_auto_compact_context_window_remaining_percent` (if set) to compute `auto_compact_limit` in tokens.
+  - Uses the same baseline as `/status` so “10% left” means what it says.
+- `codex-rs/protocol/src/protocol.rs`
+  - Exports `CONTEXT_WINDOW_BASELINE_TOKENS` (12k) so the “% left” trigger can match the UI baseline.
+  - Updates doc comments to reference the new constant name.
+- `codex-rs/core/src/compact_remote.rs`
+  - On remote compaction failure, always falls back to local compaction and reports via `BackgroundEvent`.
+  - Classifies “invalid request” (400/422) to produce a clearer prefix (“rejected” vs “failed”).
+- `codex-rs/core/src/shell.rs`
+  - Test-only fix to avoid a `cargo clippy --fix` bad rewrite (`PathBuf == &str`); uses `shell_path.as_path() == Path::new("...")`.
+- `docs/config.md`
+  - Documents `model_auto_compact_context_window_remaining_percent` and clarifies “% used” vs “% left”.
+- `AGENTS.md`
+  - Adds this work log / handoff section.
+
+### New / relevant configuration keys (Codexx)
+
+- `model_auto_compact_context_window_remaining_percent = <0..=100>`
+  - Auto-compacts when “% left” (as shown in `/status`) is **<= this value**.
+  - `<= 0` disables this trigger.
+  - Mutually exclusive with `model_auto_compact_context_window_percent`.
+- Existing/related knobs already in the fork:
+  - `model_auto_compact_token_limit = 0` (or any `<= 0`) disables auto-compaction entirely.
+  - `experimental_compact_prompt_file = "./compact.md"` replaces the built-in compaction prompt; file is re-read each compaction.
+  - `experimental_seed_last_compaction_segment_on_startup = true` seeds new sessions from the last pre-compaction segment and writes `past_session.jsonl` under `$CODEX_HOME`.
+  - `experimental_auto_new_session_on_compaction = true` starts a new seeded session after each compaction (interactive UI only).
+  - `experimental_git_commit_before_compaction = true` stages + commits right before **auto-compaction** runs (best-effort).
+  - `[features].remote_compaction = false` forces **local** compaction (avoids `/responses/compact`).
+
+### Commands run (this work session)
+
+Formatting / lint:
+
+- `cd codexx/codex-rs && just fmt`
+- `cd codexx/codex-rs && just fix -p codex-core`
+- `cd codexx/codex-rs && just fix -p codex-protocol`
+
+Tests:
+
+- `cd codexx/codex-rs && cargo test -p codex-core` (passed; 671 tests)
+- `cd codexx/codex-rs && cargo test -p codex-core auto_compact_remaining_percent` (passed; 3 tests)
+- `cd codexx/codex-rs && cargo test -p codex-protocol` (passed; 19 tests)
+
+Release build:
+
+- `cd codexx/codex-rs && cargo build -p codex-cli --bin codex --release` (succeeded; `codex-tui`/`codex-tui2` warn about `unused_assignments` in `renderable.rs`)
+
+Inspecting diffs:
+
+- `cd codexx && git status -sb`
+- `cd codexx && git diff`
+
+### Build / install / deploy (macOS + Linux)
+
+The Rust workspace binary is built as `codex` (crate `codex-cli`). To keep this fork isolated from upstream `codex`, install it under a different name (`codexx`) and use a separate `CODEX_HOME` (e.g., `~/.codexx`).
+
+macOS (Homebrew prefix):
+
+- `cd codexx/codex-rs`
+- `cargo build -p codex-cli --bin codex --release`
+- `install -m 755 target/release/codex /opt/homebrew/bin/codexx`
+
+Linux (common prefix):
+
+- `cd codexx/codex-rs`
+- `cargo build -p codex-cli --bin codex --release`
+- `sudo install -m 755 target/release/codex /usr/local/bin/codexx`
+
+Run isolated from upstream:
+
+- Prefer setting `CODEX_HOME` to a dedicated directory so upstream `codex` and this fork don’t share configs/sessions:
+  - `CODEX_HOME="$HOME/.codexx" codexx`
+
+Optional `~/.zshrc` alias:
+
+```sh
+alias codexx='env CODEX_HOME="$HOME/.codexx" command codexx'
+```
+
+### Notes / pitfalls encountered
+
+- `just fmt` prints warnings about `imports_granularity=Item` being nightly-only; formatting still completes on stable Rust.
+- `just fix -p codex-core` initially failed due to a clippy `--fix` rewrite in `core/src/shell.rs`; fixed by comparing via `Path`/`as_path()`.
+- If you reuse `CODEX_HOME` between upstream `codex` and `codexx`, configs can “bleed” between them. Use separate `CODEX_HOME` directories to keep them independent.
+
+---
+
+## Codexx fork work log (2026-01-16)
+
+### What changed (high level)
+
+Goal: ensure user/project instructions stay accurate after compaction, and make local install/run unambiguous when an older upstream `codex` binary exists on the machine.
+
+- Compaction now **re-reads user instructions** (config instructions + hierarchical `AGENTS.md` + discovered skills) and **replaces** the user-instructions item in the compaction prompt/history.
+- Installed the 0.84.0 Rust binary as `codexx` and updated `runcodexlocal.sh` to call `codexx` (so we don’t accidentally run `/usr/bin/codex`).
+
+### Files touched (currently uncommitted in `codexx`)
+
+- `codex-rs/core/src/compact.rs`
+  - Reloads user instructions at compaction time and replaces the `UserInstructions` message in the prompt/history.
+- `codex-rs/core/src/compact_remote.rs`
+  - Same behavior for remote compaction (`/responses/compact`).
+- `codex-rs/core/src/codex.rs`
+  - Exposes `Session::get_config()` as `pub(crate)` so compaction tasks can re-read instructions with the current `cwd`.
+- `codex-rs/Cargo.lock`
+  - Updated to match workspace crate versions so `cargo build --locked` works reliably.
+- `runcodexlocal.sh`
+  - Uses `codexx` (installed binary) instead of `codex`.
+
+### Build / install / run (Linux, no sudo)
+
+- Build:
+  - `cd codex-rs && cargo build -p codex-cli --bin codex --release --locked`
+- Install under user prefix:
+  - `install -m 755 codex-rs/target/release/codex ~/.local/bin/codexx`
+- Run using the repo-local home directory:
+  - `./runcodexlocal.sh`
+  - Equivalent: `env CODEX_HOME="$PWD/.codex" codexx resume --sandbox danger-full-access`

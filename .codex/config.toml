@@ -1,0 +1,27 @@
+model = "gpt-5.2"
+model_reasoning_effort = "xhigh"
+model_reasoning_summary = "none"
+model_verbosity = "low"
+model_context_window = 400000
+project_doc_max_bytes = 40000
+# file_opener = "kate"
+
+model_auto_compact_token_limit = 350000
+
+compact_prompt = "1. Update @AGENTS.md with this session current state of development, write summary of this session(what was done, which commands used, what are the issues, what recommended to proceed with in new session) in file session_hh_mm_X_dd_mm_yyyy.md(GMT+8), 2. create file compacting.done, 3. commit all changes to git(make sure .gitignore is up to date). 4. Must preserve user's key decisions in file user_decisions.md."
+
+[notice]
+hide_rate_limit_model_nudge = true
+
+[notice.model_migrations]
+"gpt-5.2" = "gpt-5.2-codex"
+
+# boolean only
+[features]
+rmcp_client = true
+web_search_request = true
+view_image_tool = true
+ghost_commit = false
+undo = false
+unified_exec = true
+parallel = true

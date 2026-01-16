@@ -9,6 +9,7 @@ use crate::codex::get_last_assistant_message_from_turn;
 use crate::error::CodexErr;
 use crate::error::Result as CodexResult;
 use crate::features::Feature;
+use crate::project_doc::get_user_instructions;
 use crate::protocol::CompactedItem;
 use crate::protocol::ContextCompactedEvent;
 use crate::protocol::EventMsg;
@@ -18,6 +19,7 @@ use crate::protocol::WarningEvent;
 use crate::truncate::TruncationPolicy;
 use crate::truncate::approx_token_count;
 use crate::truncate::truncate_text;
+use crate::user_instructions::UserInstructions;
 use crate::util::backoff;
 use codex_protocol::items::TurnItem;
 use codex_protocol::models::ContentItem;
@@ -65,11 +67,70 @@ pub(crate) async fn run_compact_task(
     run_compact_task_inner(sess.clone(), turn_context, input).await;
 }
 
+fn is_developer_message(item: &ResponseItem) -> bool {
+    matches!(item, ResponseItem::Message { role, .. } if role == "developer")
+}
+
+fn is_user_instructions_message(item: &ResponseItem) -> bool {
+    let ResponseItem::Message { role, content, .. } = item else {
+        return false;
+    };
+    if role != "user" {
+        return false;
+    }
+    UserInstructions::is_user_instructions(content)
+}
+
+fn replace_user_instructions_items(
+    mut items: Vec<ResponseItem>,
+    replacement: Option<ResponseItem>,
+) -> Vec<ResponseItem> {
+    let Some(replacement) = replacement else {
+        return items;
+    };
+
+    let prefix_len = items
+        .iter()
+        .take_while(|item| is_developer_message(item))
+        .count();
+
+    let mut out: Vec<ResponseItem> = Vec::with_capacity(items.len() + 1);
+    out.extend(items.drain(..prefix_len));
+    out.push(replacement);
+    out.extend(
+        items
+            .into_iter()
+            .filter(|item| !is_user_instructions_message(item)),
+    );
+    out
+}
+
 async fn run_compact_task_inner(
     sess: Arc<Session>,
     turn_context: Arc<TurnContext>,
     input: Vec<UserInput>,
 ) {
+    let refreshed_user_instructions = {
+        let mut cfg = (*sess.get_config().await).clone();
+        cfg.cwd.clone_from(&turn_context.cwd);
+        let skills_outcome = sess
+            .services
+            .skills_manager
+            .skills_for_cwd(&turn_context.cwd, false)
+            .await;
+        get_user_instructions(&cfg, Some(&skills_outcome.skills)).await
+    };
+    let effective_user_instructions =
+        refreshed_user_instructions.or_else(|| turn_context.user_instructions.clone());
+    let user_instructions_item: Option<ResponseItem> =
+        effective_user_instructions.as_ref().map(|text| {
+            UserInstructions {
+                directory: turn_context.cwd.to_string_lossy().into_owned(),
+                text: text.clone(),
+            }
+            .into()
+        });
+
     let initial_input_for_turn: ResponseInputItem = ResponseInputItem::from(input);
 
     let mut history = sess.clone_history().await;
@@ -91,7 +152,7 @@ async fn run_compact_task_inner(
         effort: turn_context.client.get_reasoning_effort(),
         summary: turn_context.client.get_reasoning_summary(),
         base_instructions: turn_context.base_instructions.clone(),
-        user_instructions: turn_context.user_instructions.clone(),
+        user_instructions: effective_user_instructions.clone(),
         developer_instructions: turn_context.developer_instructions.clone(),
         final_output_json_schema: turn_context.final_output_json_schema.clone(),
         truncation_policy: Some(turn_context.truncation_policy.into()),
@@ -101,6 +162,8 @@ async fn run_compact_task_inner(
     loop {
         // Clone is required because of the loop
         let turn_input = history.clone().for_prompt();
+        let turn_input =
+            replace_user_instructions_items(turn_input, user_instructions_item.clone());
         let turn_input_len = turn_input.len();
         let prompt = Prompt {
             input: turn_input,
@@ -168,6 +231,7 @@ async fn run_compact_task_inner(
     let user_messages = collect_user_messages(history_items);
 
     let initial_context = sess.build_initial_context(turn_context.as_ref());
+    let initial_context = replace_user_instructions_items(initial_context, user_instructions_item);
     let mut new_history = build_compacted_history(initial_context, &user_messages, &summary_text);
     let ghost_snapshots: Vec<ResponseItem> = history_items
         .iter()

@@ -1007,7 +1007,7 @@ impl Session {
             .await
     }
 
-    async fn get_config(&self) -> std::sync::Arc<Config> {
+    pub(crate) async fn get_config(&self) -> std::sync::Arc<Config> {
         let state = self.state.lock().await;
         state
             .session_configuration
